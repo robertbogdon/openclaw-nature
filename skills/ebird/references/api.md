@@ -1,6 +1,15 @@
 # eBird API v2.0 — Full Endpoint Reference
 
-All endpoints require the `X-eBird-ApiToken` header. Base URL: `https://api.ebird.org/v2`
+All endpoints require the `X-eBird-ApiToken` header set to `$EBIRD_API_KEY`.
+Base URL: `https://api.ebird.org/v2` (override via `$EBIRD_BASE_URL`).
+
+Guards for every request:
+```bash
+if [ -z "$EBIRD_API_KEY" ]; then
+  echo "ERROR: EBIRD_API_KEY not set"
+  exit 1
+fi
+```
 
 ## Observations — Recent Data
 

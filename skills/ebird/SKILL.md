@@ -5,11 +5,43 @@ description: Retrieve bird observation data, hotspot information, taxonomy, and 
 
 # eBird — OpenClaw Skill
 
-## Quick Start
+## Configuration
 
-All requests need an eBird API key set as `EBIRD_API_KEY` in the agent env.
+The eBird API requires an API key sent as an HTTP header on every request.
+
+### Setting the API Key
+
+The API key must be available as the environment variable `EBIRD_API_KEY`.
+There are two ways to provide it:
+
+**1. Via skills.entries config (recommended):**
+```json
+{
+  "skills": {
+    "entries": {
+      "ebird": {
+        "enabled": true,
+        "env": {
+          "EBIRD_API_KEY": "your-api-key-here"
+        }
+      }
+    }
+  }
+}
+```
+
+**2. Via agent env:** Add `EBIRD_API_KEY` to your agent's environment.
+
+### Quick Start
+
 Base URL defaults to `https://api.ebird.org/v2`.
-Send the API key as the `X-eBird-ApiToken` header.
+Set `EBIRD_BASE_URL` to override.
+
+Before making requests, resolve the API key:
+```bash
+# The key should be set as EBIRD_API_KEY in env/config
+# Use $EBIRD_API_KEY for one-off checks (see examples below)
+```
 
 ### Recent Birds in a Region
 
@@ -30,6 +62,16 @@ curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
 ```bash
 curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/ref/hotspot/geo?lat={lat}&lng={lng}&dist=10"
+```
+
+### Checking if the key is available
+
+Before making an API call, verify the key is present:
+```bash
+if [ -z "$EBIRD_API_KEY" ]; then
+  echo "ERROR: EBIRD_API_KEY not set. See Configuration section above."
+  exit 1
+fi
 ```
 
 ## Region & Species Code Ref
