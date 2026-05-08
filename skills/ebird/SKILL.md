@@ -7,7 +7,7 @@ description: Retrieve bird observation data, hotspot information, taxonomy, and 
 
 ## Configuration
 
-The eBird API requires an API key sent as an HTTP header on every request.
+The eBird API requires an API key sent as the `X-eBirdApiToken` HTTP header on every request.
 
 ### Setting the API Key
 
@@ -46,21 +46,21 @@ Before making requests, resolve the API key:
 ### Recent Birds in a Region
 
 ```bash
-curl -s -H "x-api-key: $EBIRD_API_KEY" \
+curl -s -H "X-eBirdApiToken: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/data/obs/{regionCode}/recent?maxResults=10&back=7"
 ```
 
 ### Rare Bird Alerts Nearby
 
 ```bash
-curl -s -H "x-api-key: $EBIRD_API_KEY" \
+curl -s -H "X-eBirdApiToken: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/data/obs/geo/recent/notable?lat={lat}&lng={lng}&dist=25&detail=full"
 ```
 
 ### Hotspots Near Coordinates
 
 ```bash
-curl -s -H "x-api-key: $EBIRD_API_KEY" \
+curl -s -H "X-eBirdApiToken: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/ref/hotspot/geo?lat={lat}&lng={lng}&dist=10"
 ```
 
