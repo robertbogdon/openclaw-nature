@@ -5,9 +5,6 @@ They are listed here for attribution and licensing compliance.
 
 ---
 
-_No third-party dependencies added yet. This file will be updated as
-dependencies are introduced._
-
 ## Adding an entry
 
 When a new third-party resource is added to this project, please append
@@ -18,15 +15,60 @@ it to the appropriate section below with:
 - Link to the project
 - License type
 
-## Categories
+## Data Sources
 
-If there are ever resources to list, they should be organised under
-appropriate sections such as:
+### eBird
+- **Description:** Real-time bird observation database and API. Used as the
+  primary data source for bird species sightings, hotspots, taxonomy, and
+  region information.
+- **Website:** https://ebird.org
+- **API Docs:** https://documenter.getpostman.com/view/664302/S1ENwy59
+- **License:** eBird data is owned and provided by the Cornell Lab of Ornithology.
+  See https://ebird.org/about/terms-of-use for terms.
 
-- **Python Packages** – pip-installed libraries
-- **Docker Images** – base images used in Dockerfiles or compose files
-- **JavaScript / Node Packages** – frontend or build tooling
-- **Protocols & Standards** – data formats, API specs
-- **Infrastructure** – deployment tools, databases, CI/CD services
-- **Data Sources** – APIs, datasets, or reference materials
-- **Other** – fonts, icons, design assets, etc.
+### Merlin Bird ID
+- **Description:** Bird identification app and species database by the Cornell
+  Lab of Ornithology. Source of species reference data, identification logic,
+  and sound/call libraries.
+- **Website:** https://merlin.allaboutbirds.org
+- **License:** Provided by the Cornell Lab of Ornithology. See
+  https://www.birds.cornell.edu/home/terms-of-use/ for terms.
+
+### iNaturalist
+- **Description:** Citizen science biodiversity observation platform. Used as a
+  data source for species observations, taxonomy, places, projects, and
+  identification data.
+- **Website:** https://www.inaturalist.org
+- **API Docs:** https://api.inaturalist.org/v1/docs/
+- **License:** iNaturalist data is available under CC BY-NC 4.0. See
+  https://www.inaturalist.org/pages/terms for terms.
+
+## Infrastructure
+
+### OpenClaw
+- **Description:** AI agent orchestration platform. This project is structured as
+  an OpenClaw module containing skill definitions for nature-related APIs.
+- **Website:** https://openclaw.ai
+- **Source:** https://github.com/openclaw/openclaw
+- **License:** Open-source. See https://github.com/openclaw/openclaw for license
+  details.
+
+## Python Packages
+
+_(None yet — add pip dependencies here as they are introduced)_
+
+## Docker Images
+
+_(None yet — add base images here as they are used)_
+
+## JavaScript / Node Packages
+
+_(None yet — add npm/yarn dependencies here as they are introduced)_
+
+## Protocols & Standards
+
+_(None yet — add API specs, data formats, etc.)_
+
+## Other
+
+_(None yet — add fonts, icons, design assets, etc.)_
