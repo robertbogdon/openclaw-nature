@@ -46,21 +46,21 @@ Before making requests, resolve the API key:
 ### Recent Birds in a Region
 
 ```bash
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/data/obs/{regionCode}/recent?maxResults=10&back=7"
 ```
 
 ### Rare Bird Alerts Nearby
 
 ```bash
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/data/obs/geo/recent/notable?lat={lat}&lng={lng}&dist=25&detail=full"
 ```
 
 ### Hotspots Near Coordinates
 
 ```bash
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "$EBIRD_BASE_URL/ref/hotspot/geo?lat={lat}&lng={lng}&dist=10"
 ```
 

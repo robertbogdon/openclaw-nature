@@ -1,6 +1,6 @@
 # eBird API v2.0 — Full Endpoint Reference
 
-All endpoints require the `X-eBird-ApiToken` header set to `$EBIRD_API_KEY`.
+All endpoints require the `x-api-key` header set to `$EBIRD_API_KEY`.
 Base URL: `https://api.ebird.org/v2` (override via `$EBIRD_BASE_URL`).
 
 Guards for every request:
@@ -161,31 +161,31 @@ GET /ref/nb/species/{speciesCode}
 
 ```bash
 # Recent observations in California, last 7 days
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/data/obs/US-CA/recent?back=7&maxResults=20"
 
 # Notable birds near London (50km radius, last 3 days)
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/data/obs/geo/recent/notable?lat=51.5&lng=-0.13&dist=50&back=3"
 
 # Historic data for Central Park, March 15 2025
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/data/obs/L99381/historic/2025/3/15?maxResults=50"
 
 # Look up Bald Eagle taxonomy
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/ref/taxonomy/ebird?cat=species" | \
   jq '.[] | select(.speciesCode == "baleag")'
 
 # List US states
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/ref/region/country/US/subregions"
 
 # Hotspot details
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/ref/hotspot/info/L99381"
 
 # Checklist stats
-curl -s -H "X-eBird-ApiToken: $EBIRD_API_KEY" \
+curl -s -H "x-api-key: $EBIRD_API_KEY" \
   "https://api.ebird.org/v2/product/stats/{subId}"
 ```
