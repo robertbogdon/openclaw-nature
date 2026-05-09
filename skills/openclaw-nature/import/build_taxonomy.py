@@ -58,10 +58,13 @@ FALLBACK_INAT_DB = os.path.expanduser(
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS species (
     id              INTEGER PRIMARY KEY,
-    canonical       TEXT NOT NULL UNIQUE,
+    canonical       TEXT NOT NULL,
     scientific      TEXT,
     taxon_group     TEXT,
-    category        TEXT DEFAULT 'species'
+    category        TEXT DEFAULT 'species',
+    user_label      TEXT,      -- custom name, preserved across rebuilds
+    user_notes      TEXT,      -- custom notes, preserved across rebuilds
+    UNIQUE(canonical)
 );
 
 CREATE TABLE IF NOT EXISTS ebird_species_map (
@@ -273,25 +276,57 @@ def merge_species(ebird_species, inat_species, conflicts):
 
 
 def write_species_db(session_db_path, merged_species, conflicts):
-    """Write the species + mapping tables to the session DB."""
+    """Write the species + mapping tables to the session DB.
+
+    User metadata (user_label, user_notes) is PRESERVED across rebuilds
+    via upsert by canonical name. Source mapping tables are always
+    fully rebuilt.
+    """
     conn = sqlite3.connect(session_db_path)
 
-    # Create tables
+    # Ensure schema exists (IF NOT EXISTS — never drops)
     conn.executescript(SCHEMA_SQL)
 
-    # Clear existing data (rebuild mode)
+    # Migrate: add user_label/user_notes columns if they don't exist yet
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(species)")}
+    if "user_label" not in cols:
+        conn.execute("ALTER TABLE species ADD COLUMN user_label TEXT")
+    if "user_notes" not in cols:
+        conn.execute("ALTER TABLE species ADD COLUMN user_notes TEXT")
+
+    # Save existing user metadata before rebuild
+    existing_meta = {}
+    for row in conn.execute(
+        "SELECT canonical, user_label, user_notes FROM species "
+        "WHERE user_label IS NOT NULL OR user_notes IS NOT NULL"
+    ):
+        existing_meta[row[0]] = {"user_label": row[1], "user_notes": row[2]}
+
+    # Rebuild mapping tables (source data always wins)
     conn.execute("DELETE FROM ebird_species_map")
     conn.execute("DELETE FROM inat_species_map")
-    conn.execute("DELETE FROM species")
-    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('species', 'ebird_species_map', 'inat_species_map')")
 
+    # Upsert species by canonical name — preserves user metadata
     for entry in merged_species:
+        meta = existing_meta.get(entry.canonical, {})
         conn.execute(
-            "INSERT INTO species (canonical, scientific, taxon_group, category) "
-            "VALUES (?, ?, ?, 'species')",
-            (entry.canonical, entry.scientific, entry.taxon_group),
+            """INSERT INTO species
+               (canonical, scientific, taxon_group, category, user_label, user_notes)
+               VALUES (?, ?, ?, 'species', ?, ?)
+               ON CONFLICT(canonical) DO UPDATE SET
+                scientific=excluded.scientific,
+                taxon_group=excluded.taxon_group,
+                category=excluded.category,
+                user_label=COALESCE(species.user_label, excluded.user_label),
+                user_notes=COALESCE(species.user_notes, excluded.user_notes)""",
+            (entry.canonical, entry.scientific, entry.taxon_group,
+             meta.get("user_label"), meta.get("user_notes")),
         )
-        species_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Get the species_id (works for both INSERT and existing ON CONFLICT)
+        species_id = conn.execute(
+            "SELECT id FROM species WHERE canonical = ?",
+            (entry.canonical,),
+        ).fetchone()[0]
 
         for code, display, sci in entry.ebird_codes:
             conn.execute(

@@ -729,8 +729,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     species_count INTEGER,
     species_list TEXT,
     merged       INTEGER DEFAULT 0,
+    user_label   TEXT,            -- custom user name for this session
+    user_notes   TEXT,            -- custom notes for this session
     created_at   TEXT DEFAULT (datetime('now'))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_num ON sessions(session_num);
 
 CREATE TABLE IF NOT EXISTS session_observations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,52 +742,137 @@ CREATE TABLE IF NOT EXISTS session_observations (
     source        TEXT NOT NULL,   -- 'inaturalist' or 'ebird'
     obs_id        TEXT,            -- inat:<id> or ebird:<submission_id>
     species       TEXT,
+    species_id    INTEGER,
     lat           REAL,
     lng           REAL,
     utc_timestamp TEXT,
     local_timestamp TEXT,
     is_overlay    INTEGER DEFAULT 0,  -- 1 = eBird time was assigned by overlay
-    species_id    INTEGER,
     details_json  TEXT,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
+    user_label    TEXT,            -- custom user name for this observation
+    user_notes    TEXT,            -- custom notes for this observation
+    FOREIGN KEY (session_id) REFERENCES sessions(id),
+    UNIQUE(source, obs_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_so_session  ON session_observations(session_id);
 CREATE INDEX IF NOT EXISTS idx_so_source   ON session_observations(source);
 CREATE INDEX IF NOT EXISTS idx_so_species  ON session_observations(species_id);
+
+-- User metadata tables (never dropped by the builder)
+CREATE TABLE IF NOT EXISTS session_metadata (
+    session_num   INTEGER PRIMARY KEY,
+    user_label    TEXT,            -- custom name for the session
+    user_notes    TEXT             -- custom notes
+);
+
+CREATE TABLE IF NOT EXISTS species_metadata (
+    species_id    INTEGER PRIMARY KEY REFERENCES species(id),
+    user_label    TEXT,            -- custom name for this species
+    user_notes    TEXT             -- custom notes
+);
 """
 
 
 def write_session_db(db_path, sessions, species_lookup=None, append=False):
     """Write sessions to SQLite.
 
+    Uses upsert-on-rebuild: auto-generated rows are replaced by session_num
+    (for sessions) or (source, obs_id) (for observations), but user metadata
+    columns (user_label, user_notes) are NEVER touched by the builder.
+
     Args:
         db_path: Path to output database
         sessions: List of Session objects
         species_lookup: Dict of {"ebird": {name: id}, "inat": {name: id}}
             from load_species_lookup(). If None, species_id will be NULL.
-        append: If True, don't drop existing data
+        append: If True, preserve existing rows and add new ones alongside.
     """
     if species_lookup is None:
         species_lookup = {"ebird": {}, "inat": {}}
     mode = "append" if append else "overwrite"
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = OFF")
-    if not append:
-        conn.execute("DROP TABLE IF EXISTS session_observations")
-        conn.execute("DROP TABLE IF EXISTS sessions")
+
+    # Always ensure schema tables exist (IF NOT EXISTS — never drops)
     conn.executescript(SESSION_SCHEMA)
-    conn.execute("PRAGMA foreign_keys = ON")
+
+    # Migrate: add user_label/user_notes columns if they don't exist yet
+    # (older DBs may have been created without these)
+    migrations = [
+        ("sessions", "user_label", "ALTER TABLE sessions ADD COLUMN user_label TEXT"),
+        ("sessions", "user_notes", "ALTER TABLE sessions ADD COLUMN user_notes TEXT"),
+        ("session_observations", "user_label",
+         "ALTER TABLE session_observations ADD COLUMN user_label TEXT"),
+        ("session_observations", "user_notes",
+         "ALTER TABLE session_observations ADD COLUMN user_notes TEXT"),
+    ]
+    existing_cols = {}
+    for t in ["sessions", "session_observations"]:
+        existing_cols[t] = {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
+    for table, col, sql in migrations:
+        if col not in existing_cols.get(table, set()):
+            conn.execute(sql)
+
+    # Get existing user_label/user_notes from sessions before upsert
+    existing_labels = {}
+    for row in conn.execute(
+        "SELECT session_num, user_label, user_notes FROM sessions "
+        "WHERE user_label IS NOT NULL OR user_notes IS NOT NULL"
+    ):
+        existing_labels[row[0]] = {"user_label": row[1], "user_notes": row[2]}
+
+    # Get existing observation user metadata before upsert
+    obs_metadata = {}
+    for row in conn.execute(
+        "SELECT source, obs_id, user_label, user_notes "
+        "FROM session_observations "
+        "WHERE (user_label IS NOT NULL OR user_notes IS NOT NULL)"
+    ):
+        key = (row[0], row[1])
+        obs_metadata[key] = {"user_label": row[2], "user_notes": row[3]}
+
+    if not append:
+        # Remove auto-generated rows only — metadata tables untouched
+        conn.execute("DELETE FROM session_observations")
+        conn.execute("DELETE FROM sessions")
 
     for sess in sessions:
         d = sess.to_dict()
         is_merged = 1 if sess.ebird_count > 0 and sess.inat_count > 0 else 0
+
+        # Restore any user-set label/notes
+        user_label = None
+        user_notes = None
+        meta = existing_labels.get(d["session_num"])
+        if meta:
+            user_label = meta["user_label"]
+            user_notes = meta["user_notes"]
+
         conn.execute(
             """INSERT INTO sessions
                (session_num, start_utc, end_utc, start_local, end_local,
                 duration, location, centroid_lat, centroid_lng,
-                num_obs, ebird_count, inat_count, species_count, species_list, merged)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                num_obs, ebird_count, inat_count, species_count,
+                species_list, merged, user_label, user_notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_num) DO UPDATE SET
+                start_utc=excluded.start_utc,
+                end_utc=excluded.end_utc,
+                start_local=excluded.start_local,
+                end_local=excluded.end_local,
+                duration=excluded.duration,
+                location=excluded.location,
+                centroid_lat=excluded.centroid_lat,
+                centroid_lng=excluded.centroid_lng,
+                num_obs=excluded.num_obs,
+                ebird_count=excluded.ebird_count,
+                inat_count=excluded.inat_count,
+                species_count=excluded.species_count,
+                species_list=excluded.species_list,
+                merged=excluded.merged,
+                user_label=COALESCE(sessions.user_label, excluded.user_label),
+                user_notes=COALESCE(sessions.user_notes, excluded.user_notes)""",
             (
                 d["session_num"], d["start_utc"], d["end_utc"],
                 d["start_local"], d["end_local"],
@@ -791,9 +880,13 @@ def write_session_db(db_path, sessions, species_lookup=None, append=False):
                 d["centroid_lat"], d["centroid_lng"],
                 d["num_obs"], d["ebird_count"], d["inat_count"],
                 d["species_count"], d["species_list"], is_merged,
+                user_label, user_notes,
             ),
         )
-        session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        session_id = conn.execute(
+            "SELECT id FROM sessions WHERE session_num = ?",
+            (d["session_num"],),
+        ).fetchone()[0]
 
         # Write iNat observations
         for obs in sess.inat_obs:
@@ -806,14 +899,31 @@ def write_session_db(db_path, sessions, species_lookup=None, append=False):
             sid = resolve_species_id(
                 species_lookup, obs["species"], "inat"
             )
+            # Restore observation user metadata
+            obs_key = (obs["source"], obs["obs_id"])
+            obs_m = obs_metadata.get(obs_key, {})
             conn.execute(
                 """INSERT INTO session_observations
                    (session_id, source, obs_id, species, species_id, lat, lng,
-                    utc_timestamp, local_timestamp, is_overlay, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    utc_timestamp, local_timestamp, is_overlay, details_json,
+                    user_label, user_notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source, obs_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    species=excluded.species,
+                    species_id=excluded.species_id,
+                    lat=excluded.lat,
+                    lng=excluded.lng,
+                    utc_timestamp=excluded.utc_timestamp,
+                    local_timestamp=excluded.local_timestamp,
+                    is_overlay=excluded.is_overlay,
+                    details_json=excluded.details_json,
+                    user_label=COALESCE(session_observations.user_label, excluded.user_label),
+                    user_notes=COALESCE(session_observations.user_notes, excluded.user_notes)""",
                 (session_id, obs["source"], obs["obs_id"], obs["species"],
                  sid, obs["lat"], obs["lng"],
-                 obs["utc_dt"].isoformat(), local_ts, 0, details),
+                 obs["utc_dt"].isoformat(), local_ts, 0, details,
+                 obs_m.get("user_label"), obs_m.get("user_notes")),
             )
 
         # Write eBird overlay observations
@@ -822,15 +932,31 @@ def write_session_db(db_path, sessions, species_lookup=None, append=False):
             sid = resolve_species_id(
                 species_lookup, e["species"], "ebird"
             )
+            obs_key = ("ebird", e["checklist_id"])
+            obs_m = obs_metadata.get(obs_key, {})
             conn.execute(
                 """INSERT INTO session_observations
                    (session_id, source, obs_id, species, species_id, lat, lng,
-                    utc_timestamp, local_timestamp, is_overlay, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    utc_timestamp, local_timestamp, is_overlay, details_json,
+                    user_label, user_notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source, obs_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    species=excluded.species,
+                    species_id=excluded.species_id,
+                    lat=excluded.lat,
+                    lng=excluded.lng,
+                    utc_timestamp=excluded.utc_timestamp,
+                    local_timestamp=excluded.local_timestamp,
+                    is_overlay=excluded.is_overlay,
+                    details_json=excluded.details_json,
+                    user_label=COALESCE(session_observations.user_label, excluded.user_label),
+                    user_notes=COALESCE(session_observations.user_notes, excluded.user_notes)""",
                 (session_id, "ebird", e["checklist_id"], e["species"],
                  sid, e["lat"], e["lng"],
                  e["assigned_dt"].isoformat() if e["assigned_dt"] else "",
-                 local_ts, 1, "{}"),
+                 local_ts, 1, "{}",
+                 obs_m.get("user_label"), obs_m.get("user_notes")),
             )
 
     conn.commit()
