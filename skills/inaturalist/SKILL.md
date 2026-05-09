@@ -157,6 +157,25 @@ python3 import/inat_to_sqlite.py --no-prompt
 
 The script reads the `INAT_USER_LOGIN` env var (set automatically by the skill config).
 
+### Downloading Observation Photos & Sounds
+
+After importing, download all attached images and sound recordings:
+
+```bash
+# Import + download in one step
+python3 import/inat_to_sqlite.py --download-media
+
+# Download only (if DB already populated)
+python3 import/inat_to_sqlite.py --download-only
+```
+
+Photos are saved to `import/images/` as `{photo_id}.jpg` (original resolution).
+Sounds are saved to `import/sounds/` as `{sound_id}.{ext}`.
+
+The downloader is **idempotent** — it skips files that already exist and have content, so you can safely re-run to grab anything that was missed. It uses a 300ms delay between downloads to be polite to the S3 servers.
+
+Progress is reported every 25 files, with per-type totals at the end.
+
 ### Querying the local database
 
 ```bash
