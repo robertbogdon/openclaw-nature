@@ -117,6 +117,8 @@ The skill includes a personal data browser flow and SQLite importer at `import/`
    ```
    The page shows a "Success!" confirmation. eBird then emails a download link.
 4. **User provides the download URL** from the eBird email (`do-not-reply@ebird.org`).
+> ⚠️ **Rate limit:** eBird only generates one export per day. Do not request a download more than once every 24 hours — repeated requests will be rejected by eBird's server.
+
 5. **Download, extract, and import:**
    ```bash
    curl -sL -o /tmp/ebird_download.zip "<url-from-email>"
