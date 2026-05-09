@@ -128,7 +128,59 @@ See the reference files for full endpoint docs:
 **Quality grades:** `research` (>66% community ID agreement), `needs_id`, `casual`
 **Iconic taxa:** `Animalia`, `Aves`, `Mammalia`, `Reptilia`, `Amphibia`, `Actinopterygii`, `Insecta`, `Arachnida`, `Mollusca`, `Fungi`, `Plantae`, `Protozoa`, `Chromista`
 
-## Rate Limits
+## User Data Import
+
+The skill includes a Python 3 script at `import/inat_to_sqlite.py` that fetches all of a user's observations from the iNaturalist API and stores them in a local SQLite database.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `import/inat_to_sqlite.py` | Fetches observations via the API (paginated, up to 200/page), flattens nested fields (taxon, user, photos), writes to SQLite using `INSERT OR REPLACE`. Stdlib only — no pip packages needed. |
+| `import/inat.db` | Generated on first run. Schema includes `observations` table (all flattened fields), `metadata` table (record count, max id, import timestamp), and indexes on date, taxon, and user. |
+
+### Usage
+
+```bash
+# Full import (all observations for the configured user)
+python3 import/inat_to_sqlite.py
+
+# Incremental sync — only fetch observations newer than your last known id
+python3 import/inat_to_sqlite.py --id-above 350000000
+
+# Override user for a different account
+python3 import/inat_to_sqlite.py --user-login other_user
+
+# Skip confirmation prompt (for automation)
+python3 import/inat_to_sqlite.py --no-prompt
+```
+
+The script reads the `INAT_USER_LOGIN` env var (set automatically by the skill config).
+
+### Querying the local database
+
+```bash
+# Recent observations
+sqlite3 import/inat.db "SELECT observed_on, taxon_name, place_guess
+  FROM observations ORDER BY observed_on DESC LIMIT 10;"
+
+# Species count
+sqlite3 import/inat.db "SELECT taxon_name, COUNT(*) AS cnt
+  FROM observations WHERE taxon_name IS NOT NULL
+  GROUP BY taxon_name ORDER BY cnt DESC LIMIT 10;"
+
+# Observations from a specific month
+sqlite3 import/inat.db "SELECT observed_on, taxon_name, place_guess
+  FROM observations WHERE observed_on LIKE '2025-06-%' ORDER BY observed_on;"
+
+# Observations as CSV (for sharing/external use)
+sqlite3 -header -csv import/inat.db \
+  "SELECT id, observed_on, taxon_name, latitude, longitude, place_guess
+   FROM observations ORDER BY observed_on;" > observations.csv
+```
+
+### Rate Limits
 
 Unauthenticated: ~100 req/min per IP. Authenticated: ~500 req/min.
 Check response headers for `X-RateLimit-*`.
+The script is polite (0.5s delay between pages) and won't hit rate limits for typical personal data sizes.
