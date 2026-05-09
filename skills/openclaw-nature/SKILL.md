@@ -7,9 +7,25 @@ description: Merge eBird and iNaturalist observation data into unified "sessions
 
 A skill that merges eBird and iNaturalist observations into unified **sessions** — outings grouped by proximity in time and space.
 
-## Quick Start
+## How It Works (Two-Phase Algorithm)
 
-Build sessions from Robert's eBird + iNaturalist data for a specific date range:
+**Phase 1 — Cluster iNaturalist observations** (they have accurate timestamps):
+- Observations sorted by UTC timestamp
+- Same session if within `DISTANCE_KM` (default 1 km) of the *last* observation
+- AND within `TIME_MINUTES` (default 120 min) of the *previous* observation's time
+- Otherwise, start a new session
+
+**Phase 2 — Overlay eBird checklists onto iNat sessions:**
+- eBird CSV only has dates (times are unreliable)
+- For each eBird checklist, find the best-matching iNat session on the same date
+  within `DISTANCE_KM` of any observation in that session
+- If matched: eBird species are **merged into the iNat session** and assigned the
+  session's **end time** (they happened during the outing, recorded later)
+- If no match: the checklist becomes a standalone eBird-only session
+- **Original data is never modified** — the overlay is stored in
+  `openclaw-nature.db` with an `is_overlay` flag on each observation
+
+## Quick Start
 
 ```bash
 python3 import/build_sessions.py \
@@ -19,53 +35,32 @@ python3 import/build_sessions.py \
   --time 120
 ```
 
-The script auto-discovers the eBird and iNaturalist databases in the sibling skill directories.
-
 ### Output
 
 ```
   ── OpenClaw Nature Session Report ──
-  Sessions:     35
+  Sessions:     9
   Observations: 239 (74 eBird, 165 iNaturalist)
+  Merged:       6 sessions (both sources)
+  iNat-only:    3 sessions
+  eBird-only:   0 sessions
 
-  Session  Start (local)          End (local)            Location            Obs  eB  iNat
-  #1       2026-05-04T05:00:00    2026-05-04T05:00:00    Tierrasanta...       9    0    9
-  #2       2026-05-04T12:00:00    2026-05-04T12:00:00    Tierrasanta...       9    9    0
-  ...
+  Session  Start (local)          End (local)            Duration   ... Obs   eB   iNat  Species
+  #1       2026-05-04T05:00:00    2026-05-04T05:00:00    00:00:00  ... 18   9    9     16
+  #3       2026-05-05T05:00:00    2026-05-05T05:00:00    00:00:00  ... 12   9    3     12
+  #4       2026-05-06T05:00:00    2026-05-06T05:00:00    00:00:00  ... 23   18   5     22
+  #8       2026-05-07T05:00:00    2026-05-07T05:00:00    00:00:00  ... 82   15   67    69
+  #9       2026-05-08T05:00:00    2026-05-08T05:00:00    00:00:00  ... 45   5    40    37
 ```
 
 ### Save outputs
 
 ```bash
-# Write sessions database
-python3 import/build_sessions.py --session-db import/sessions.db
-
-# CSV report
+python3 import/build_sessions.py --session-db import/openclaw-nature.db
 python3 import/build_sessions.py --csv import/sessions.csv
 ```
 
-## How Sessions Work
-
-Observations from both sources are merged, sorted by UTC timestamp, then grouped:
-
-1. **Start a session** with the first observation
-2. **Keep adding** while:
-   - Location is within `DISTANCE_THRESHOLD` (default 1 km) of the **last** observation
-   - Time is within `TIME_THRESHOLD` (default 2 hours) of the **previous** observation's time
-3. **Start a new session** when either threshold is exceeded
-
-### Timezone Handling
-
-- **eBird**: Times are local (assume America/Los_Angeles). Converts to UTC using DST-aware offset calculation. Observations with no time default to noon local.
-- **iNaturalist**: `time_observed_at` is ISO 8601 with explicit UTC offset. Parsed directly to UTC. Observations with no time default to noon UTC.
-
-### Distance
-
-Haversine formula, stdlib only. Configurable threshold in km.
-
 ## Configuration
-
-All settings are CLI arguments:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -75,10 +70,10 @@ All settings are CLI arguments:
 | `--end-date` | *all* | Filter end date (YYYY-MM-DD) |
 | `--dist` | `1.0` | Distance threshold in km |
 | `--time` | `120` | Time threshold in minutes |
-| `--session-db` | `import/sessions.db` | Output SQLite database path |
+| `--session-db` | `import/openclaw-nature.db` | Output SQLite database path |
 | `--csv` | *none* | Output CSV report file path |
 | `--tz` | `America/Los_Angeles` | Display timezone for timestamps |
-| `--no-db` | *false* | Skip writing to sessions.db |
+| `--no-db` | *false* | Skip writing to openclaw-nature.db |
 
 ## Examples
 
@@ -101,55 +96,57 @@ python3 import/build_sessions.py \
 
 ## Querying Sessions
 
-After running with `--session-db`, query with Python or sqlite3:
-
 ```bash
 # All sessions
 python3 -c "
 import sqlite3
-conn = sqlite3.connect('import/sessions.db')
-for r in conn.execute('SELECT session_num, start_utc, location_summary, num_obs, species_count FROM sessions ORDER BY session_num'):
+conn = sqlite3.connect('import/openclaw-nature.db')
+for r in conn.execute('SELECT session_num, start_utc, location, num_obs, species_count FROM sessions ORDER BY session_num'):
     print(f'#{r[0]}: {r[3]} observations ({r[4]} species) at {r[2]} on {r[1]}')
 "
 
-# Biggest session (most observations)
+# Only eBird overlay observations in a session
 python3 -c "
 import sqlite3
-conn = sqlite3.connect('import/sessions.db')
-r = conn.execute('SELECT session_num, num_obs, location_summary FROM sessions ORDER BY num_obs DESC LIMIT 1').fetchone()
-print(f'Biggest session: #{r[0]} with {r[1]} observations at {r[2]}')
+conn = sqlite3.connect('import/openclaw-nature.db')
+for r in conn.execute('''SELECT species FROM session_observations
+    WHERE session_id = (SELECT id FROM sessions WHERE session_num = 1)
+    AND source = \"ebird\"'''):
+    print(f'  eBird: {r[0]}')
 "
 
-# Observations in session #7
+# Observations that are NOT overlays (direct observations)
 python3 -c "
 import sqlite3
-conn = sqlite3.connect('import/sessions.db')
-for r in conn.execute('''SELECT source, species, lat, lng FROM session_observations 
-    WHERE session_id = (SELECT id FROM sessions WHERE session_num = 7)'''):
-    print(f'[{r[0]}] {r[1]}')
+conn = sqlite3.connect('import/openclaw-nature.db')
+count = conn.execute('SELECT COUNT(*) FROM session_observations WHERE is_overlay = 0').fetchone()[0]
+print(f'Direct observations: {count}')
+overlay = conn.execute('SELECT COUNT(*) FROM session_observations WHERE is_overlay = 1').fetchone()[0]
+print(f'Overlay (eBird assigned) observations: {overlay}')
 "
 ```
 
-## Agent Query Patterns
+## Timezone Handling
 
-| User Intent | Pattern |
-|---|---|
-| "What did I observe on May 4th?" | `build_sessions.py --start-date 2026-05-04 --end-date 2026-05-04` |
-| "Show me all my outings last week" | `build_sessions.py --start-date <7 days ago> --end-date <today>` |
-| "What was my biggest session?" | Query sessions.db: `ORDER BY num_obs DESC LIMIT 1` |
-| "Merge all my recent observations" | `build_sessions.py --time 360 --dist 2.0` (wider grouping) |
-| "What species did I see at Blue Sky?" | `grep 'Blue Sky' sessions.csv` or query sessions.db |
+- **eBird**: Times are local (assume America/Los_Angeles). Only used for eBird-only sessions (fallback noon). In overlay mode, eBird times are replaced by the session's end time.
+- **iNaturalist**: `time_observed_at` is ISO 8601 with explicit UTC offset. Parsed directly to UTC. This drives the session clustering.
+- **Display**: Always shown in the configured timezone (default America/Los_Angeles / Pacific).
+
+## Distance
+
+Haversine formula, stdlib only. Configurable km threshold.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `import/build_sessions.py` | The session builder script (stdlib only) |
-| `import/sessions.db` | Generated session database |
+| `import/openclaw-nature.db` | Generated session database (contains sessions + observations) |
 | `import/sessions.csv` | Optional CSV export |
-| `references/schema.md` | Session database and CSV schema reference |
+| `references/schema.md` | Database schema reference |
 
 ## Data Sources
 
-- **eBird**: `../ebird/import/ebird.db` — checklist-level observations
-- **iNaturalist**: `../inaturalist/import/inat.db` — individual observations
+- **eBird**: `../ebird/import/ebird.db` — checklist-level observations (never modified)
+- **iNaturalist**: `../inaturalist/import/inat.db` — individual observations (never modified)
+- **Overlay data**: stored in `openclaw-nature.db` with `is_overlay=1` flag

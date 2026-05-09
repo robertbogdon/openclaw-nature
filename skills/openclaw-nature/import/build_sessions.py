@@ -5,22 +5,35 @@ OpenClaw Nature — Session Builder
 Groups eBird and iNaturalist observations into unified "sessions"
 (outings at the same place and time).
 
-Algorithm:
-1. Collect all observations from both sources within a date range
-2. Normalize timestamps to UTC datetime objects
-3. Sort by UTC timestamp
-4. Iterate through sorted observations, applying proximity grouping:
-   - Same session if within DISTANCE_THRESHOLD (default 1 km) of last obs
-     AND within TIME_THRESHOLD (default 120 min) of previous obs time
-   - Otherwise, start a new session
-5. Print a session report and optionally write to sessions.db
+ALGORITHM (Two-phase):
+
+Phase 1 — Cluster iNaturalist observations by proximity in space & time:
+   - iNaturalist timestamps are accurate (ISO 8601 with UTC offset)
+   - Group them by the standard session rule:
+     * Sort by UTC timestamp
+     * Same session if within DISTANCE_KM of the LAST observation
+       AND within TIME_MINUTES of the PREVIOUS observation's time
+     * Otherwise start a new session
+   - Each iNat session gets a start time (first obs), end time (last obs),
+     centroid location, and explicit UTC boundaries
+
+Phase 2 — Overlay eBird onto iNat sessions:
+   - eBird CSV only has dates (times defaulted to noon) — not reliable
+   - For each eBird checklist, find ALL iNat sessions on the same date
+     within DISTANCE_KM of the checklist location
+   - If EXACTLY ONE session matches: merge eBird species into that
+     session. eBird observations are ASSIGNED the session's END TIME
+     (they happened during the outing, even if recorded separately).
+   - If MULTIPLE sessions match (ambiguous): create an eBird-only
+     session — we can't know which outing the checklist belongs to.
+   - If NO sessions match: create an eBird-only session.
+   - Original eBird data is NEVER modified — the overlay is stored
+     in openclaw-nature.db with an is_overlay flag on each observation
 
 Usage:
     python3 import/build_sessions.py
     python3 import/build_sessions.py --start-date 2026-05-04 --end-date 2026-05-08
-    python3 import/build_sessions.py --dist 2.0 --time 180 --tz America/New_York
-    python3 import/build_sessions.py --ebird-db ../ebird/import/ebird.db
-    python3 import/build_sessions.py --no-output   # only print report, don't write DB
+    python3 import/build_sessions.py --dist 1.0 --time 120
 
 Stdlib only — no external dependencies.
 """
@@ -30,8 +43,10 @@ import csv
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
+from collections import defaultdict
 from datetime import datetime, date, time, timedelta, timezone
 
 # ── Defaults ───────────────────────────────────────────────────────────
@@ -42,14 +57,14 @@ DEFAULT_EBIRD_DB = os.path.join(
 DEFAULT_INAT_DB = os.path.join(
     os.path.dirname(__file__), "..", "inaturalist", "import", "inat.db"
 )
-DEFAULT_SESSION_DB = os.path.join(os.path.dirname(__file__), "sessions.db")
+DEFAULT_SESSION_DB = os.path.join(os.path.dirname(__file__), "openclaw-nature.db")
 
 FALLBACK_EBIRD_DB = "/home/openclaw/.openclaw/workspace/zookeeper/modules/ebird/ebird.db"
 FALLBACK_INAT_DB = "/home/openclaw/.openclaw/workspace/skills/inaturalist/import/inat.db"
 
 DISTANCE_THRESHOLD_KM = 1.0
 TIME_THRESHOLD_MINUTES = 120
-OUTPUT_TIMEZONE = "America/Los_Angeles"  # for display
+OUTPUT_TIMEZONE = "America/Los_Angeles"
 
 # ── Haversine ──────────────────────────────────────────────────────────
 
@@ -68,13 +83,9 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 # ── Timezone helpers ───────────────────────────────────────────────────
 
-# Simple UTC offset parsing for ISO 8601 strings with explicit offsets
-# We don't use pytz/zoneinfo - just parse offsets manually for the Pacific TZ
-
 
 def _parse_offset(offset_str):
-    """Parse a timezone offset string like '-07:00' or '+00:00' or 'Z'
-    into a timedelta."""
+    """Parse a timezone offset string like '-07:00' or '+00:00' or 'Z'."""
     if offset_str == "Z" or offset_str == "z":
         return timedelta(0)
     sign = 1
@@ -92,40 +103,34 @@ def _parse_offset(offset_str):
 
 
 def parse_inat_timestamp(ts_str):
-    """Parse iNaturalist ISO 8601 timestamp with offset to UTC datetime.
+    """Parse iNaturalist ISO 8601 timestamp to naive UTC datetime.
 
-    Handles formats:
-        '2025-06-15T14:30:00-07:00'
-        '2025-06-15T14:30:00Z'
-        '2025-06-15T14:30:00+00:00'
+    Handles formats like:
+      2026-05-06T07:36:18-07:00
+      2026-05-06T14:36:18Z
+      2026-05-06T14:36:18+00:00
+
+    Uses regex to find the timezone offset so that dashes in the
+    date portion (e.g., 2026-05-06) are NOT confused with negative
+    UTC offsets (e.g., -07:00).
     """
     if not ts_str:
         return None
-    # Normalize 'Z' suffix
     ts_str = ts_str.strip()
-    if ts_str.endswith("Z") or ts_str.endswith("z"):
-        ts_str = ts_str[:-1] + "+00:00"
 
-    # Split date/time part from offset
-    if "+" in ts_str[10:]:
-        dt_str, offset_str = ts_str.rsplit("+", 1)
-        offset_str = "+" + offset_str
-    elif "-" in ts_str[10:]:
-        # Find the rightmost '-' after the time part that is the offset
-        # e.g. "2025-06-15T14:30:00-07:00" - the T splits date from time
-        # Find the '-' or '+' that starts the timezone offset
-        # ISO 8601: after time part, the offset starts with + or -
-        # Walk backwards from the end to find the offset separator
-        parts = ts_str.rsplit("-", 2)
-        if len(parts) == 3:
-            dt_str = parts[0]
-            offset_str = "-" + parts[1] + "-" + parts[2]
-        else:
-            # No timezone info — treat as UTC
-            dt_str = ts_str
-            offset_str = "+00:00"
+    # Normalize Z suffix
+    normalized = ts_str
+    if normalized.endswith("Z") or normalized.endswith("z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    # Match timezone offset at the end of the string:
+    # [+-]HH:MM (e.g., -07:00, +00:00, +05:30)
+    match = re.search(r"([+-])(\d{2}):(\d{2})$", normalized)
+    if match:
+        offset_str = match.group(0)
+        dt_str = normalized[: match.start()]
     else:
-        dt_str = ts_str
+        dt_str = normalized
         offset_str = "+00:00"
 
     try:
@@ -134,127 +139,44 @@ def parse_inat_timestamp(ts_str):
         return None
 
     offset = _parse_offset(offset_str)
-    # Make offset-aware and convert to UTC
-    dt_with_offset = dt.replace(tzinfo=timezone.utc) - offset
-    # Return naive UTC
-    return dt_with_offset.replace(tzinfo=None)
-
-
-def parse_ebird_timestamp(obs_date, obs_time, local_tz_name="America/Los_Angeles"):
-    """Parse eBird date+time into a UTC datetime.
-
-    eBird times are LOCAL time (usually Pacific for this data).
-    If no time is given, we use noon on that date as a default.
-
-    Args:
-        obs_date: 'YYYY-MM-DD' string
-        obs_time: 'HH:MM AM/PM' or 'HH:MM:SS' or 'HH:MM' or None/empty
-        local_tz_name: IANA timezone name for the local time
-    """
-    if not obs_date:
-        return None
-
-    # Parse date
-    parts = obs_date.strip().split("-")
-    if len(parts) != 3:
-        return None
-    d = date(int(parts[0]), int(parts[1]), int(parts[2]))
-
-    # Parse time (if available)
-    t = None
-    if obs_time and obs_time.strip():
-        t_str = obs_time.strip().upper()
-        try:
-            if "AM" in t_str or "PM" in t_str:
-                t = datetime.strptime(t_str, "%I:%M %p").time()
-            elif t_str.count(":") == 2:
-                t = datetime.strptime(t_str, "%H:%M:%S").time()
-            elif t_str.count(":") == 1:
-                t = datetime.strptime(t_str, "%H:%M").time()
-        except ValueError:
-            pass
-
-    if t is None:
-        t = time(12, 0)  # default to noon if no time
-
-    local_dt = datetime.combine(d, t)
-
-    # Convert local time to UTC using the configured timezone offset.
-    # For America/Los_Angeles, approximate offset:
-    #   PDT = UTC-7 (March~November), PST = UTC-8 (November~March)
-    # Use a rough heuristic based on date
-    offset_hours = _local_tz_offset(local_dt, local_tz_name)
-    utc_dt = local_dt - timedelta(hours=offset_hours)
-    return utc_dt
+    utc_dt = dt.replace(tzinfo=timezone.utc) - offset
+    return utc_dt.replace(tzinfo=None)
 
 
 def _local_tz_offset(dt, tz_name="America/Los_Angeles"):
-    """Estimate UTC offset for America/Los_Angeles based on date.
-
-    Second Sunday of March at 2AM -> PDT (UTC-7)
-    First Sunday of November at 2AM -> PST (UTC-8)
-    """
+    """Estimate UTC offset for America/Los_Angeles on a given date."""
     if tz_name != "America/Los_Angeles":
-        # For other timezones, warn and default to -8
         return -8
-
     year = dt.year
-    # DST starts second Sunday of March at 2AM
     mar_1 = date(year, 3, 1)
-    # First Sunday
     first_sun_mar = mar_1 + timedelta(days=(6 - mar_1.weekday()))
-    dst_start = first_sun_mar + timedelta(days=7)  # second Sunday
+    dst_start = first_sun_mar + timedelta(days=7)
     dst_start_dt = datetime.combine(dst_start, time(2, 0))
-
-    # DST ends first Sunday of November at 2AM
     nov_1 = date(year, 11, 1)
     dst_end = nov_1 + timedelta(days=(6 - nov_1.weekday()))
     dst_end_dt = datetime.combine(dst_end, time(2, 0))
-
     if dst_start_dt <= dt < dst_end_dt:
-        return -7  # PDT
+        return -7
     else:
-        return -8  # PST
+        return -8
 
 
 def utc_to_local(utc_dt, local_tz_name="America/Los_Angeles"):
-    """Convert a naive UTC datetime to local time string (Pacific).
-
-    Returns (local_dt_string, offset_hours).
-    """
+    """Convert naive UTC datetime to local time, return (iso_string, offset_hours)."""
     offset_h = _local_tz_offset(utc_dt, local_tz_name)
     local_dt = utc_dt + timedelta(hours=offset_h)
     return local_dt.isoformat(), offset_h
 
 
-# ── Observation types ──────────────────────────────────────────────────
-
-
-class Observation:
-    """A single observation record from eBird or iNaturalist."""
-
-    def __init__(self, source, obs_id, utc_dt, lat, lng, species, location_name):
-        self.source = source  # 'ebird' or 'inaturalist'
-        self.obs_id = str(obs_id)
-        self.utc_dt = utc_dt  # naive datetime in UTC
-        self.lat = lat
-        self.lng = lng
-        self.species = species or "Unknown"
-        self.location_name = location_name or ""
-
-    def __repr__(self):
-        return (
-            f"<{self.source}:{self.obs_id} "
-            f"{self.utc_dt.isoformat()}Z "
-            f"{self.species} @ ({self.lat}, {self.lng})>"
-        )
+def utc_to_local_str(utc_dt, local_tz_name="America/Los_Angeles"):
+    s, _ = utc_to_local(utc_dt, local_tz_name)
+    return s
 
 
 # ── Database readers ───────────────────────────────────────────────────
 
 
 def _resolve_db_path(path, fallback=None):
-    """Resolve a DB path, trying the given path first, then fallback."""
     abspath = os.path.abspath(path)
     if os.path.exists(abspath):
         return abspath
@@ -264,88 +186,8 @@ def _resolve_db_path(path, fallback=None):
     return abspath
 
 
-def read_ebird_observations(db_path, start_date=None, end_date=None):
-    """Fetch eBird observations from SQLite DB.
-
-    Returns list of Observation objects.
-    Returns empty list if DB doesn't exist or has no table.
-    """
-    if not os.path.exists(db_path):
-        print(f"  eBird DB not found: {db_path}", file=sys.stderr)
-        return []
-
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-
-        # Verify schema
-        tables = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='observations'"
-        ).fetchall()
-        if not tables:
-            conn.close()
-            print(f"  eBird DB has no 'observations' table: {db_path}", file=sys.stderr)
-            return []
-
-        query = """
-            SELECT submission_id, common_name, scientific_name,
-                   obs_date, obs_time, latitude, longitude, location_name
-            FROM observations
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-        """
-        params = []
-        if start_date:
-            query += " AND obs_date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND obs_date <= ?"
-            params.append(end_date)
-        query += " ORDER BY obs_date, obs_time"
-
-        rows = conn.execute(query, params).fetchall()
-        conn.close()
-
-        # Observations are per-species-per-checklist (multiple rows per
-        # checklist). We group them: each unique submission_id + date becomes
-        # one observation entry (since all rows in a checklist share lat/lng).
-        checklists = {}  # key: (submission_id, date) -> first row data
-        for r in rows:
-            key = (r["submission_id"], r["obs_date"])
-            if key not in checklists:
-                checklists[key] = r
-
-        obs_list = []
-        for key, r in checklists.items():
-            utc_dt = parse_ebird_timestamp(r["obs_date"], r["obs_time"])
-            if utc_dt is None:
-                continue
-            species = r["common_name"] or r["scientific_name"] or "Unknown"
-            loc = r["location_name"] or ""
-            obs_list.append(
-                Observation(
-                    source="ebird",
-                    obs_id=key[0],
-                    utc_dt=utc_dt,
-                    lat=r["latitude"],
-                    lng=r["longitude"],
-                    species=species,
-                    location_name=loc,
-                )
-            )
-
-        return obs_list
-
-    except Exception as e:
-        print(f"  Error reading eBird DB: {e}", file=sys.stderr)
-        return []
-
-
-def read_inaturalist_observations(db_path, start_date=None, end_date=None):
-    """Fetch iNaturalist observations from SQLite DB.
-
-    Returns list of Observation objects.
-    Returns empty list if DB doesn't exist or has no table.
-    """
+def read_inat_observations(db_path, start_date=None, end_date=None):
+    """Fetch iNaturalist observations with full detail."""
     if not os.path.exists(db_path):
         print(f"  iNat DB not found: {db_path}", file=sys.stderr)
         return []
@@ -353,20 +195,20 @@ def read_inaturalist_observations(db_path, start_date=None, end_date=None):
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='observations'"
         ).fetchall()
         if not tables:
             conn.close()
-            print(f"  iNat DB has no 'observations' table: {db_path}", file=sys.stderr)
             return []
 
         query = """
-            SELECT id, time_observed_at, observed_on,
-                   taxon_name, latitude, longitude, place_guess
+            SELECT id, observed_on, time_observed_at, latitude, longitude,
+                   species_guess, taxon_name, place_guess,
+                   tags, annotations, photos_json, sounds_json,
+                   identifications_json
             FROM observations
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            WHERE latitude IS NOT NULL
         """
         params = []
         if start_date:
@@ -375,419 +217,555 @@ def read_inaturalist_observations(db_path, start_date=None, end_date=None):
         if end_date:
             query += " AND observed_on <= ?"
             params.append(end_date)
-        query += " ORDER BY time_observed_at, observed_on"
+        query += " ORDER BY observed_on, time_observed_at"
 
         rows = conn.execute(query, params).fetchall()
         conn.close()
 
-        obs_list = []
+        result = []
         for r in rows:
             utc_dt = parse_inat_timestamp(r["time_observed_at"])
             if utc_dt is None:
-                # If no time, use noon UTC on observed_on date
-                if r["observed_on"]:
-                    parts = r["observed_on"].strip().split("-")
-                    if len(parts) == 3:
-                        utc_dt = datetime(
-                            int(parts[0]), int(parts[1]), int(parts[2]), 12, 0
-                        )
-            if utc_dt is None:
-                continue
-
-            species = r["taxon_name"] or "Unknown"
-            loc = r["place_guess"] or ""
-            obs_list.append(
-                Observation(
-                    source="inaturalist",
-                    obs_id=r["id"],
-                    utc_dt=utc_dt,
-                    lat=r["latitude"],
-                    lng=r["longitude"],
-                    species=species,
-                    location_name=loc,
-                )
-            )
-
-        return obs_list
-
+                # Fallback: use noon on observed_on
+                d = datetime.fromisoformat(r["observed_on"])
+                utc_dt = d.replace(hour=12, minute=0, second=0)
+            species = r["species_guess"] or r["taxon_name"] or "Unknown"
+            result.append({
+                "obs_id": f"inat:{r['id']}",
+                "source": "inaturalist",
+                "utc_dt": utc_dt,
+                "lat": r["latitude"],
+                "lng": r["longitude"],
+                "species": species,
+                "place_guess": r["place_guess"] or "",
+                "observed_on": r["observed_on"],
+                "tags": r["tags"],
+                "annotations": r["annotations"],
+                "photos_json": r["photos_json"],
+                "sounds_json": r["sounds_json"],
+                "identifications_json": r["identifications_json"],
+            })
+        return result
     except Exception as e:
         print(f"  Error reading iNat DB: {e}", file=sys.stderr)
         return []
 
 
-# ── Session building ───────────────────────────────────────────────────
+def read_ebird_checklists(db_path, start_date=None, end_date=None):
+    """Fetch eBird checklists grouped by submission_id.
+
+    Returns a dict: {submission_id: {'date': str, 'lat': float, 'lng': float,
+                                      'location_name': str, 'species': [str]}}
+    """
+    if not os.path.exists(db_path):
+        print(f"  eBird DB not found: {db_path}", file=sys.stderr)
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='observations'"
+        ).fetchall()
+        if not tables:
+            conn.close()
+            return []
+
+        query = """
+            SELECT submission_id, obs_date, latitude, longitude, location_name,
+                   common_name, scientific_name
+            FROM observations
+            WHERE latitude IS NOT NULL
+        """
+        params = []
+        if start_date:
+            query += " AND obs_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND obs_date <= ?"
+            params.append(end_date)
+        query += " ORDER BY submission_id"
+
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+
+        checklists = {}
+        for r in rows:
+            sid = r["submission_id"]
+            if sid not in checklists:
+                checklists[sid] = {
+                    "submission_id": sid,
+                    "obs_date": r["obs_date"],
+                    "lat": r["latitude"],
+                    "lng": r["longitude"],
+                    "location_name": r["location_name"] or "",
+                    "species": [],
+                }
+            species = r["common_name"] or r["scientific_name"] or "Unknown"
+            checklists[sid]["species"].append(species)
+
+        return list(checklists.values())
+    except Exception as e:
+        print(f"  Error reading eBird DB: {e}", file=sys.stderr)
+        return []
+
+
+# ── Session Data Structure ─────────────────────────────────────────────
 
 
 class Session:
-    """A group of observations at the same place and time."""
+    """A unified outing session, populated in two phases."""
 
-    def __init__(self, first_obs):
-        self.observations = [first_obs]
-        self.start_utc = first_obs.utc_dt
-        self.end_utc = first_obs.utc_dt
-        self.lats = [first_obs.lat]
-        self.lngs = [first_obs.lng]
-        self.locations = set()
-        if first_obs.location_name:
-            self.locations.add(first_obs.location_name)
-
-    def try_add(self, obs, dist_km, time_threshold_min, time_threshold_prev_min):
-        """Check if obs can be added to this session.
-
-        Args:
-            obs: The observation to try adding
-            dist_km: Distance threshold in km
-            time_threshold_min: Time threshold from previous obs in minutes
-            time_threshold_prev_min: Time threshold from the *previous* obs (same as time_threshold_min)
-
-        Returns:
-            True if added, False if should start new session
-        """
-        last_obs = self.observations[-1]
-
-        # Check distance from LAST observation's location
-        d = haversine_km(last_obs.lat, last_obs.lng, obs.lat, obs.lng)
-
-        # Check time from PREVIOUS observation's time
-        td = (obs.utc_dt - last_obs.utc_dt).total_seconds() / 60.0  # minutes
-
-        if d <= dist_km and td <= time_threshold_min:
-            self.observations.append(obs)
-            self.end_utc = obs.utc_dt
-            self.lats.append(obs.lat)
-            self.lngs.append(obs.lng)
-            if obs.location_name:
-                self.locations.add(obs.location_name)
-            return True
-
-        return False
-
-    @property
-    def centroid_lat(self):
-        return sum(self.lats) / len(self.lats) if self.lats else 0.0
-
-    @property
-    def centroid_lng(self):
-        return sum(self.lngs) / len(self.lngs) if self.lngs else 0.0
-
-    @property
-    def duration(self):
-        return self.end_utc - self.start_utc
+    def __init__(self, session_num):
+        self.session_num = session_num
+        # iNat observations (source = "inaturalist")
+        self.inat_obs = []
+        # eBird species (source = "ebird")
+        self.ebird_species = []  # list of {"species": str, "checklist_id": str}
+        # Temporal bounds (set by iNat phase)
+        self.start_utc = None
+        self.end_utc = None
+        # Spatial info
+        self.all_lats = []
+        self.all_lngs = []
+        self.place_guesses = set()
 
     @property
     def num_obs(self):
-        return len(self.observations)
+        return len(self.inat_obs) + len(self.ebird_species)
 
     @property
     def ebird_count(self):
-        return sum(1 for o in self.observations if o.source == "ebird")
+        return len(self.ebird_species)
 
     @property
     def inat_count(self):
-        return sum(1 for o in self.observations if o.source == "inaturalist")
+        return len(self.inat_obs)
 
     @property
-    def species_set(self):
-        return set(o.species for o in self.observations)
+    def centroid_lat(self):
+        if not self.all_lats:
+            return 0.0
+        return sum(self.all_lats) / len(self.all_lats)
+
+    @property
+    def centroid_lng(self):
+        if not self.all_lngs:
+            return 0.0
+        return sum(self.all_lngs) / len(self.all_lngs)
 
     @property
     def location_summary(self):
-        if self.locations:
-            return "; ".join(sorted(self.locations)[:3])
-        return f"({self.centroid_lat:.4f}, {self.centroid_lng:.4f})"
+        parts = sorted(self.place_guesses)
+        return "; ".join(parts) if parts else "Unknown"
+
+    @property
+    def species_set(self):
+        s = {o["species"] for o in self.inat_obs}
+        s.update(e["species"] for e in self.ebird_species)
+        return s
+
+    @property
+    def duration(self):
+        if self.start_utc and self.end_utc:
+            return self.end_utc - self.start_utc
+        return timedelta(0)
+
+    def add_inat_obs(self, obs):
+        """Add an iNaturalist observation."""
+        self.inat_obs.append(obs)
+        self.all_lats.append(obs["lat"])
+        self.all_lngs.append(obs["lng"])
+        if obs.get("place_guess"):
+            self.place_guesses.add(obs["place_guess"])
+
+        if self.start_utc is None or obs["utc_dt"] < self.start_utc:
+            self.start_utc = obs["utc_dt"]
+        if self.end_utc is None or obs["utc_dt"] > self.end_utc:
+            self.end_utc = obs["utc_dt"]
+
+    def merge_ebird_checklist(self, checklist):
+        """Overlay an eBird checklist onto this session.
+
+        eBird species get the session's END TIME as their timestamp (overlay).
+        The centroid is updated to include the eBird location.
+        """
+        self.all_lats.append(checklist["lat"])
+        self.all_lngs.append(checklist["lng"])
+        if checklist.get("location_name"):
+            self.place_guesses.add(checklist["location_name"])
+
+        for sp in checklist["species"]:
+            self.ebird_species.append({
+                "species": sp,
+                "checklist_id": checklist["submission_id"],
+                "assigned_dt": self.end_utc,  # overlay time = session end
+                "lat": checklist["lat"],
+                "lng": checklist["lng"],
+            })
+
+    def to_dict(self):
+        """Return a dict suitable for CSV or DB insertion."""
+        d = self.duration
+        total_secs = int(d.total_seconds())
+        dur_str = f"{total_secs // 3600:02d}:{(total_secs % 3600) // 60:02d}:{total_secs % 60:02d}"
+        return {
+            "session_num": self.session_num,
+            "start_utc": self.start_utc.isoformat() if self.start_utc else "",
+            "end_utc": self.end_utc.isoformat() if self.end_utc else "",
+            "start_local": utc_to_local_str(self.start_utc) if self.start_utc else "",
+            "end_local": utc_to_local_str(self.end_utc) if self.end_utc else "",
+            "duration": dur_str,
+            "location": self.location_summary,
+            "centroid_lat": round(self.centroid_lat, 6),
+            "centroid_lng": round(self.centroid_lng, 6),
+            "num_obs": self.num_obs,
+            "ebird_count": self.ebird_count,
+            "inat_count": self.inat_count,
+            "species_count": len(self.species_set),
+            "species_list": ", ".join(sorted(self.species_set)),
+        }
 
 
-def build_sessions(observations, dist_km=1.0, time_min=120):
-    """Group observations into sessions.
+# ── Phase 1: Cluster iNaturalist observations ─────────────────────────
 
-    Args:
-        observations: List of Observation objects (sorted by UTC time)
-        dist_km: Distance threshold in km
-        time_min: Time threshold in minutes
 
-    Returns:
-        List of Session objects
+def cluster_inat_obs(obs_list, dist_km=1.0, time_min=120):
+    """Group iNat observations into sessions by spatial-temporal proximity.
+
+    Standard session algorithm:
+    - Sort by UTC timestamp
+    - Same session if within dist_km of the LAST observation
+      AND within time_min of the PREVIOUS observation's time
+    - Otherwise start a new session
     """
-    if not observations:
-        return []
-
-    # Sort by UTC time
-    sorted_obs = sorted(observations, key=lambda o: o.utc_dt)
-
+    sorted_obs = sorted(obs_list, key=lambda o: o["utc_dt"])
     sessions = []
-    current_session = Session(sorted_obs[0])
+    current = None
 
-    for obs in sorted_obs[1:]:
-        if not current_session.try_add(obs, dist_km, time_min, time_min):
-            # Start new session
-            sessions.append(current_session)
-            current_session = Session(obs)
+    for obs in sorted_obs:
+        if current is None:
+            current = Session(len(sessions) + 1)
+            current.add_inat_obs(obs)
+            sessions.append(current)
+            continue
 
-    # Don't forget the last session
-    sessions.append(current_session)
+        # Check distance from LAST observation
+        last_obs = current.inat_obs[-1]
+        d = haversine_km(last_obs["lat"], last_obs["lng"], obs["lat"], obs["lng"])
+
+        # Check time from PREVIOUS observation
+        t = (obs["utc_dt"] - last_obs["utc_dt"]).total_seconds() / 60.0
+
+        if d <= dist_km and abs(t) <= time_min:
+            current.add_inat_obs(obs)
+        else:
+            current = Session(len(sessions) + 1)
+            current.add_inat_obs(obs)
+            sessions.append(current)
 
     return sessions
 
 
-# ── Session DB Writer ──────────────────────────────────────────────────
+# ── Phase 2: Overlay eBird onto sessions ──────────────────────────────
+
+
+def overlay_ebird(sessions, ebird_checklists, dist_km=1.0):
+    """Overlay eBird checklists onto existing sessions.
+
+    For each eBird checklist:
+    1. Find all sessions on the same date that have observations within dist_km
+    2. If exactly ONE session matches, merge eBird species into that session
+    3. If ZERO sessions match (no iNat nearby), create a new eBird-only session
+    4. If MULTIPLE sessions match (ambiguous), create a new eBird-only session
+       — we can't know which outing the birds belong to
+
+    Returns: (updated_sessions, unmatched_checklists)
+    """
+    unmatched = []
+
+    # Build a spatial index per date: for each iNat session, list its
+    # observation coordinates so we can check distance
+    inat_session_map = {}  # date_str -> [(session, lat, lng), ...]
+    for sess in sessions:
+        d = sess.start_utc.strftime("%Y-%m-%d") if sess.start_utc else ""
+        if d not in inat_session_map:
+            inat_session_map[d] = []
+        for obs in sess.inat_obs:
+            inat_session_map[d].append((sess, obs["lat"], obs["lng"]))
+
+    next_num = len(sessions) + 1
+
+    for cl in ebird_checklists:
+        cl_date = cl["obs_date"]
+
+        # Find ALL sessions within range
+        candidates = inat_session_map.get(cl_date, [])
+        matching_sessions = set()
+        for sess, slat, slng in candidates:
+            d = haversine_km(cl["lat"], cl["lng"], slat, slng)
+            if d <= dist_km:
+                matching_sessions.add(sess)
+
+        if len(matching_sessions) == 1:
+            # Unambiguous match — merge into this session
+            matched_session = list(matching_sessions)[0]
+            matched_session.merge_ebird_checklist(cl)
+        else:
+            # Ambiguous (2+ matches) or no iNat nearby
+            cl["_num_matching_sessions"] = len(matching_sessions)
+            unmatched.append(cl)
+
+    # Group unmatched checklists by date + location grid cell (~1.1km
+    # resolution) so checklists at the same park become one eBird-only
+    # session instead of many singleton sessions.
+    LOC_GROUP_DEG = 0.01
+    groups = defaultdict(list)
+    for cl in unmatched:
+        glat = round(cl["lat"] / LOC_GROUP_DEG) * LOC_GROUP_DEG
+        glng = round(cl["lng"] / LOC_GROUP_DEG) * LOC_GROUP_DEG
+        groups[(cl["obs_date"], glat, glng)].append(cl)
+
+    for (gdate, _, _), checklists in groups.items():
+        sess = _make_ebird_session_from_checklists(checklists, next_num)
+        next_num += 1
+        sessions.append(sess)
+
+    return sessions, unmatched
+
+
+def _make_ebird_session_from_checklists(checklists, session_num):
+    """Create a new session from one or more eBird checklists with no
+    iNat partner.
+
+    All checklists share the same date and approximate location, so they
+    form a single session. Uses noon local as the default timestamp.
+    """
+    sess = Session(session_num)
+
+    # Collect all location info
+    all_lats = []
+    all_lngs = []
+    for cl in checklists:
+        all_lats.append(cl["lat"])
+        all_lngs.append(cl["lng"])
+        if cl.get("location_name"):
+            sess.place_guesses.add(cl["location_name"])
+
+    # Centroid
+    sess.all_lats = all_lats
+    sess.all_lngs = all_lngs
+
+    # Default timestamp: noon local
+    parts = checklists[0]["obs_date"].split("-")
+    d = date(int(parts[0]), int(parts[1]), int(parts[2]))
+    noon_utc = datetime.combine(d, time(12, 0))
+    offset = _local_tz_offset(noon_utc)
+    default_ts = noon_utc - timedelta(hours=offset)
+
+    for cl in checklists:
+        for sp in cl["species"]:
+            sess.ebird_species.append({
+                "species": sp,
+                "checklist_id": cl["submission_id"],
+                "assigned_dt": default_ts,
+                "lat": cl["lat"],
+                "lng": cl["lng"],
+            })
+
+    sess.start_utc = default_ts
+    sess.end_utc = default_ts
+    return sess
+
+
+# ── Output ─────────────────────────────────────────────────────────────
+
+
+def print_session_report(sessions, local_tz_name=OUTPUT_TIMEZONE, csv_output=None):
+    """Print a formatted session report and optionally write CSV."""
+    total_obs = sum(s.num_obs for s in sessions)
+    total_eb = sum(s.ebird_count for s in sessions)
+    total_inat = sum(s.inat_count for s in sessions)
+
+    print(f"\n  {'─' * 200}")
+    print(f"  Session  Start (local)          End (local)            Duration   Location{' ':<50} Lat       Lng       Obs   eB   iNat  Species ")
+    print(f"  {'─' * 200}")
+
+    for sess in sessions:
+        d = sess.to_dict()
+        loc = d["location"]
+        if len(loc) > 52:
+            loc = loc[:49] + "..."
+        dur_s = d["duration"]
+        print(
+            f"  #{d['session_num']:<5} {d['start_local']:<23} {d['end_local']:<23} {dur_s:<10} {loc:<52} "
+            f"{d['centroid_lat']:.4f}   {d['centroid_lng']:.4f}  "
+            f"{d['num_obs']:<4} {d['ebird_count']:<3} {d['inat_count']:<4} {d['species_count']:<6}"
+        )
+    print(f"  {'─' * 200}")
+    print(
+        f"  Total{' ':<99}"
+        f"{total_obs:<5} {total_eb:<4} {total_inat:<4}"
+    )
+
+    # Detailed per-session
+    for sess in sessions:
+        d = sess.to_dict()
+        print(f"\n  Session #{d['session_num']} ({d['start_local']}) — {d['location']}")
+        print(f"    Duration: {d['duration']}  |  {d['num_obs']} obs ({d['ebird_count']} eBird, {d['inat_count']} iNat)  |  {d['species_count']} species")
+        # Show iNat first
+        if sess.inat_obs:
+            inat_species = sorted(set(o["species"] for o in sess.inat_obs))
+            print(f"    iNat species ({len(inat_species)}): {', '.join(inat_species[:20])}{'…' if len(inat_species) > 20 else ''}")
+        # Then eBird overlay
+        if sess.ebird_species:
+            eb_species = sorted(set(e["species"] for e in sess.ebird_species))
+            print(f"    eBird overlay ({len(eb_species)}): {', '.join(eb_species[:20])}{'…' if len(eb_species) > 20 else ''}")
+
+    # Summary
+    merged = [s for s in sessions if s.ebird_count > 0 and s.inat_count > 0]
+    print(f"\n  ── Summary ──")
+    print(f"  Total sessions: {len(sessions)}")
+    print(f"  iNat-only sessions: {sum(1 for s in sessions if s.inat_count > 0 and s.ebird_count == 0)}")
+    print(f"  eBird-only sessions: {sum(1 for s in sessions if s.ebird_count > 0 and s.inat_count == 0)}")
+    print(f"  Merged sessions (both sources): {len(merged)}")
+    print(f"  Total observations: {total_obs} ({total_eb} eBird, {total_inat} iNat)")
+
+    if merged:
+        print(f"\n  ── Merged Session Details ──")
+        for sess in merged:
+            d = sess.to_dict()
+            print(f"  #{d['session_num']}: {d['location']}")
+            print(f"     {d['inat_count']} iNat observations ({d['start_local']} → {d['end_local']})")
+            print(f"     + {d['ebird_count']} eBird species overlaid at end time")
+
+    # CSV output
+    if csv_output:
+        fieldnames = [
+            "session_num", "start_utc", "end_utc", "start_local", "end_local",
+            "duration",
+            "location", "centroid_lat", "centroid_lng",
+            "num_obs", "ebird_count", "inat_count", "species_count", "species_list",
+        ]
+        with open(csv_output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for sess in sessions:
+                writer.writerow(sess.to_dict())
+        print(f"\n  CSV written to: {os.path.abspath(csv_output)}")
+
+
+# ── SQLite Schema ─────────────────────────────────────────────────────
 
 
 SESSION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_num     INTEGER NOT NULL,
-    start_utc       TEXT NOT NULL,
-    end_utc         TEXT NOT NULL,
-    duration_seconds REAL,
-    centroid_lat    REAL,
-    centroid_lng    REAL,
-    location_summary TEXT,
-    num_obs         INTEGER NOT NULL,
-    ebird_count     INTEGER DEFAULT 0,
-    inat_count      INTEGER DEFAULT 0,
-    species_count   INTEGER DEFAULT 0,
-    species_list    TEXT
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_num  INTEGER NOT NULL,
+    start_utc    TEXT,
+    end_utc      TEXT,
+    start_local  TEXT,
+    end_local    TEXT,
+    duration     TEXT,
+    location     TEXT,
+    centroid_lat REAL,
+    centroid_lng REAL,
+    num_obs      INTEGER,
+    ebird_count  INTEGER,
+    inat_count   INTEGER,
+    species_count INTEGER,
+    species_list TEXT,
+    merged       INTEGER DEFAULT 0,
+    created_at   TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS session_observations (
-    session_id  INTEGER NOT NULL,
-    source      TEXT NOT NULL,
-    obs_id      TEXT NOT NULL,
-    species     TEXT,
-    lat         REAL,
-    lng         REAL,
-    utc_time    TEXT,
-    location_name TEXT,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER REFERENCES sessions(id),
+    source        TEXT NOT NULL,   -- 'inaturalist' or 'ebird'
+    obs_id        TEXT,            -- inat:<id> or ebird:<submission_id>
+    species       TEXT,
+    lat           REAL,
+    lng           REAL,
+    utc_timestamp TEXT,
+    local_timestamp TEXT,
+    is_overlay    INTEGER DEFAULT 0,  -- 1 = eBird time was assigned by overlay
+    details_json  TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_utc);
-CREATE INDEX IF NOT EXISTS idx_sessions_obs ON session_observations(session_id);
+CREATE INDEX IF NOT EXISTS idx_so_session ON session_observations(session_id);
+CREATE INDEX IF NOT EXISTS idx_so_source  ON session_observations(source);
 """
 
 
 def write_session_db(db_path, sessions, append=False):
-    """Write sessions to SQLite database.
-
-    Args:
-        db_path: Path to sessions.db
-        sessions: List of Session objects
-        append: If True, don't clear existing data
-    """
+    """Write sessions to SQLite."""
     mode = "append" if append else "overwrite"
-    print(f"\n  Writing sessions to: {os.path.abspath(db_path)} ({mode})")
+    exists = os.path.exists(db_path)
+    if exists and not append:
+        os.remove(db_path)
 
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    # Ensure both sessions + metadata tables exist
     conn.executescript(SESSION_SCHEMA)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS metadata (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
-    """)
-
-    if not append:
-        conn.execute("DELETE FROM session_observations")
-        conn.execute("DELETE FROM sessions")
 
     for sess in sessions:
-        dur = sess.duration.total_seconds()
-        species_list = ", ".join(sorted(sess.species_set))
+        d = sess.to_dict()
+        is_merged = 1 if sess.ebird_count > 0 and sess.inat_count > 0 else 0
         conn.execute(
             """INSERT INTO sessions
-               (session_num, start_utc, end_utc, duration_seconds,
-                centroid_lat, centroid_lng, location_summary,
-                num_obs, ebird_count, inat_count, species_count, species_list)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (session_num, start_utc, end_utc, start_local, end_local,
+                duration, location, centroid_lat, centroid_lng,
+                num_obs, ebird_count, inat_count, species_count, species_list, merged)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                sessions.index(sess) + 1,
-                sess.start_utc.isoformat(),
-                sess.end_utc.isoformat(),
-                dur,
-                sess.centroid_lat,
-                sess.centroid_lng,
-                sess.location_summary,
-                sess.num_obs,
-                sess.ebird_count,
-                sess.inat_count,
-                len(sess.species_set),
-                species_list,
+                d["session_num"], d["start_utc"], d["end_utc"],
+                d["start_local"], d["end_local"],
+                d["duration"], d["location"],
+                d["centroid_lat"], d["centroid_lng"],
+                d["num_obs"], d["ebird_count"], d["inat_count"],
+                d["species_count"], d["species_list"], is_merged,
             ),
         )
         session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        for obs in sess.observations:
+        # Write iNat observations
+        for obs in sess.inat_obs:
+            local_ts = utc_to_local_str(obs["utc_dt"])
+            details = json.dumps(
+                {k: obs[k] for k in ["tags", "annotations", "photos_json",
+                                     "sounds_json", "identifications_json", "place_guess"]
+                 if k in obs}
+            )
             conn.execute(
                 """INSERT INTO session_observations
-                   (session_id, source, obs_id, species, lat, lng, utc_time, location_name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    obs.source,
-                    obs.obs_id,
-                    obs.species,
-                    obs.lat,
-                    obs.lng,
-                    obs.utc_dt.isoformat(),
-                    obs.location_name,
-                ),
+                   (session_id, source, obs_id, species, lat, lng,
+                    utc_timestamp, local_timestamp, is_overlay, details_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, obs["source"], obs["obs_id"], obs["species"],
+                 obs["lat"], obs["lng"],
+                 obs["utc_dt"].isoformat(), local_ts, 0, details),
             )
 
-    # Metadata
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-        ("built_at", datetime.now(timezone.utc).isoformat()),
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-        ("num_sessions", str(len(sessions))),
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-        ("dist_km", str(dist_km)),
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-        ("time_min", str(time_min)),
-    )
+        # Write eBird overlay observations
+        for e in sess.ebird_species:
+            local_ts = utc_to_local_str(e["assigned_dt"]) if e["assigned_dt"] else ""
+            conn.execute(
+                """INSERT INTO session_observations
+                   (session_id, source, obs_id, species, lat, lng,
+                    utc_timestamp, local_timestamp, is_overlay, details_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, "ebird", e["checklist_id"], e["species"],
+                 e["lat"], e["lng"],
+                 e["assigned_dt"].isoformat() if e["assigned_dt"] else "",
+                 local_ts, 1, "{}"),
+            )
 
     conn.commit()
+    size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    print(f"\n  Session DB written to: {os.path.abspath(db_path)} ({size / 1024:.0f} KB)")
+    print(f"  Mode: {mode}")
     conn.close()
-
-
-# ── Report printing ────────────────────────────────────────────────────
-
-
-def print_session_report(sessions, local_tz_name="America/Los_Angeles", csv_output=None):
-    """Print a formatted session report.
-
-    Args:
-        sessions: List of Session objects
-        local_tz_name: IANA timezone name for display
-        csv_output: If set, a file path to write CSV output
-    """
-    if not sessions:
-        print("\n  No sessions found.")
-        return
-
-    total_obs = sum(s.num_obs for s in sessions)
-    total_ebird = sum(s.ebird_count for s in sessions)
-    total_inat = sum(s.inat_count for s in sessions)
-
-    print(f"\n  ── OpenClaw Nature Session Report ──")
-    print(f"  Sessions:     {len(sessions)}")
-    print(f"  Observations: {total_obs} ({total_ebird} eBird, {total_inat} iNaturalist)")
-    print(
-        f"  Date range:   {sessions[0].start_utc.isoformat()}Z to {sessions[-1].end_utc.isoformat()}Z"
-    )
-    print(f"  Distance threshold: {dist_km} km")
-    print(f"  Time threshold:     {time_min} minutes")
-    print(f"  Display timezone:   {local_tz_name}")
-    print()
-
-    # Column widths
-    cols = ["Session", "Start (local)", "End (local)", "Duration",
-            "Location", "Lat", "Lng", "Obs", "eB", "iNat", "Species"]
-    header = "  {:<8} {:<22} {:<22} {:<10} {:<38} {:<9} {:<9} {:<5} {:<4} {:<5} {:<8}".format(*cols)
-    sep = "  " + "-" * len(header)
-
-    print(sep)
-    print(header)
-    print(sep)
-
-    for i, sess in enumerate(sessions):
-        start_local, _ = utc_to_local(sess.start_utc, local_tz_name)
-        end_local, _ = utc_to_local(sess.end_utc, local_tz_name)
-        dur_str = str(sess.duration).split(".")[0]  # trim microseconds
-
-        loc = sess.location_summary
-        if len(loc) > 38:
-            loc = loc[:35] + "..."
-
-        print(
-            "  {:<8} {:<22} {:<22} {:<10} {:<38} {:<9.4f} {:<9.4f} {:<5} {:<4} {:<5} {:<8}".format(
-                f"#{i+1}",
-                start_local,
-                end_local,
-                dur_str,
-                loc,
-                sess.centroid_lat,
-                sess.centroid_lng,
-                sess.num_obs,
-                sess.ebird_count,
-                sess.inat_count,
-                len(sess.species_set),
-            )
-        )
-
-    print(sep)
-    print(f"  Total{'':<8} {'':<22} {'':<22} {'':<10} {'':<38} {'':<9} {'':<9} {total_obs:<5} {total_ebird:<4} {total_inat:<5}")
-    print()
-
-    # Print details for each session
-    print("  ── Session Details ──")
-    for i, sess in enumerate(sessions):
-        start_local, _ = utc_to_local(sess.start_utc, local_tz_name)
-        print(f"\n  Session #{i+1} ({start_local}) — {sess.location_summary}")
-        print(f"    Duration: {sess.duration}")
-        print(f"    Species ({len(sess.species_set)}): {', '.join(sorted(sess.species_set))}")
-        print(f"    Observations: {sess.num_obs} ({sess.ebird_count} eBird, {sess.inat_count} iNat)")
-        # Show first few observations
-        for obs in sess.observations[:5]:
-            print(
-                f"      [{obs.source}] {obs.species} @ ({obs.lat:.4f}, {obs.lng:.4f})"
-            )
-        if len(sess.observations) > 5:
-            print(f"      ... and {len(sess.observations) - 5} more")
-
-    # CSV output
-    if csv_output:
-        _write_csv(csv_output, sessions, local_tz_name)
-
-
-def _write_csv(path, sessions, local_tz_name):
-    """Write session report to CSV file."""
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "session_num",
-                "start_local",
-                "end_local",
-                "duration",
-                "location",
-                "centroid_lat",
-                "centroid_lng",
-                "num_obs",
-                "ebird_count",
-                "inat_count",
-                "species_count",
-                "species_list",
-            ]
-        )
-        for i, sess in enumerate(sessions):
-            start_local, _ = utc_to_local(sess.start_utc, local_tz_name)
-            end_local, _ = utc_to_local(sess.end_utc, local_tz_name)
-            dur_str = str(sess.duration).split(".")[0]
-            writer.writerow(
-                [
-                    i + 1,
-                    start_local,
-                    end_local,
-                    dur_str,
-                    sess.location_summary,
-                    f"{sess.centroid_lat:.6f}",
-                    f"{sess.centroid_lng:.6f}",
-                    sess.num_obs,
-                    sess.ebird_count,
-                    sess.inat_count,
-                    len(sess.species_set),
-                    ", ".join(sorted(sess.species_set)),
-                ]
-            )
-    print(f"\n  CSV written to: {os.path.abspath(path)}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -797,111 +775,67 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build nature observation sessions from eBird + iNaturalist data"
     )
-    parser.add_argument(
-        "--ebird-db",
-        default=DEFAULT_EBIRD_DB,
-        help=f"Path to eBird SQLite DB (default: relative to script)",
-    )
-    parser.add_argument(
-        "--inat-db",
-        default=DEFAULT_INAT_DB,
-        help=f"Path to iNaturalist SQLite DB (default: relative to script)",
-    )
-    parser.add_argument(
-        "--session-db",
-        default=None,
-        help="Path to output sessions.db (default: no DB written unless specified)",
-    )
-    parser.add_argument(
-        "--start-date",
-        default=None,
-        help="Start date (YYYY-MM-DD). Default: all data",
-    )
-    parser.add_argument(
-        "--end-date",
-        default=None,
-        help="End date (YYYY-MM-DD). Default: all data",
-    )
-    parser.add_argument(
-        "--dist",
-        type=float,
-        default=DISTANCE_THRESHOLD_KM,
-        help=f"Distance threshold in km (default: {DISTANCE_THRESHOLD_KM})",
-    )
-    parser.add_argument(
-        "--time",
-        type=int,
-        default=TIME_THRESHOLD_MINUTES,
-        help=f"Time threshold in minutes (default: {TIME_THRESHOLD_MINUTES})",
-    )
-    parser.add_argument(
-        "--tz",
-        default=OUTPUT_TIMEZONE,
-        help=f"Display timezone (default: {OUTPUT_TIMEZONE})",
-    )
-    parser.add_argument(
-        "--csv",
-        default=None,
-        help="Write session report to CSV file",
-    )
-    parser.add_argument(
-        "--no-db",
-        action="store_true",
-        help="Skip writing to sessions.db even if --session-db is set",
-    )
+    parser.add_argument("--ebird-db", default=DEFAULT_EBIRD_DB)
+    parser.add_argument("--inat-db", default=DEFAULT_INAT_DB)
+    parser.add_argument("--session-db", default=None)
+    parser.add_argument("--start-date", default=None)
+    parser.add_argument("--end-date", default=None)
+    parser.add_argument("--dist", type=float, default=DISTANCE_THRESHOLD_KM)
+    parser.add_argument("--time", type=int, default=TIME_THRESHOLD_MINUTES)
+    parser.add_argument("--tz", default=OUTPUT_TIMEZONE)
+    parser.add_argument("--csv", default=None)
+    parser.add_argument("--no-db", action="store_true")
     args = parser.parse_args()
 
-    global dist_km, time_min
-    dist_km = args.dist
-    time_min = args.time
-
-    # Resolve DB paths
     ebird_db = _resolve_db_path(args.ebird_db, FALLBACK_EBIRD_DB)
     inat_db = _resolve_db_path(args.inat_db, FALLBACK_INAT_DB)
+    session_db = args.session_db if args.session_db else DEFAULT_SESSION_DB
 
-    session_db = args.session_db
-    if session_db is None and not args.no_db:
-        session_db = DEFAULT_SESSION_DB
-
-    print("OpenClaw Nature — Session Builder")
+    print("OpenClaw Nature — Session Builder (Overlay Mode)")
     print("=" * 50)
     print(f"  eBird DB:       {ebird_db}")
     print(f"  iNat DB:        {inat_db}")
     print(f"  Date range:     {args.start_date or 'all'} to {args.end_date or 'all'}")
-    print(f"  Distance thresh: {dist_km} km")
-    print(f"  Time thresh:    {time_min} min")
+    print(f"  Distance thresh: {args.dist} km")
+    print(f"  Time thresh:    {args.time} min")
     print(f"  Display TZ:     {args.tz}")
+    print(f"\n  Two-phase algorithm:")
+    print(f"    1. Cluster iNaturalist observations by proximity (space + time)")
+    print(f"    2. Overlay eBird checklists onto same-date iNat clusters")
+    print(f"       eBird observations assigned the session's END TIME")
     print()
 
-    # Read observations
-    print("  Reading eBird observations...")
-    ebird_obs = read_ebird_observations(ebird_db, args.start_date, args.end_date)
-    print(f"    Found {len(ebird_obs)} eBird checklists")
-
+    # Phase 1: Read data
     print("  Reading iNaturalist observations...")
-    inat_obs = read_inaturalist_observations(inat_db, args.start_date, args.end_date)
+    inat_obs = read_inat_observations(inat_db, args.start_date, args.end_date)
     print(f"    Found {len(inat_obs)} iNaturalist observations")
 
-    all_obs = ebird_obs + inat_obs
-    print(f"\n  Total: {len(all_obs)} observations from both sources")
+    print("  Reading eBird checklists...")
+    ebird_cls = read_ebird_checklists(ebird_db, args.start_date, args.end_date)
+    print(f"    Found {len(ebird_cls)} eBird checklists")
 
-    if not all_obs:
-        print("\n  No observations to process. Exiting.")
+    if not inat_obs:
+        print("\n  No iNaturalist observations to cluster. Exiting.")
         return
 
-    # Build sessions
-    print("  Building sessions...")
-    sessions = build_sessions(all_obs, dist_km=dist_km, time_min=time_min)
+    # Phase 1: Cluster iNat
+    print(f"\n  Phase 1: Clustering {len(inat_obs)} iNaturalist observations...")
+    sessions = cluster_inat_obs(inat_obs, dist_km=args.dist, time_min=args.time)
+    print(f"    Created {len(sessions)} iNat session(s)")
 
-    # Print report
+    # Phase 2: Overlay eBird
+    print(f"\n  Phase 2: Overlaying {len(ebird_cls)} eBird checklists onto sessions...")
+    sessions, unmatched = overlay_ebird(sessions, ebird_cls, dist_km=args.dist)
+    print(f"    Matched: {len(ebird_cls) - len(unmatched)} checklists")
+    print(f"    Unmatched (eBird-only sessions): {len(unmatched)} checklists")
+
+    # Report
     print_session_report(sessions, local_tz_name=args.tz, csv_output=args.csv)
 
-    # Write session DB
-    if session_db and not args.no_db:
+    # Write DB
+    if not args.no_db and session_db:
         write_session_db(session_db, sessions, append=False)
 
 
 if __name__ == "__main__":
-    dist_km = DISTANCE_THRESHOLD_KM
-    time_min = TIME_THRESHOLD_MINUTES
     main()
