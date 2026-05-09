@@ -22,7 +22,10 @@ from datetime import datetime, timezone
 
 # ── Config ──────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "inat.db")
-USER_LOGIN = os.environ.get("INAT_USER_LOGIN", "your-username-here")
+USER_LOGIN = os.environ.get("INAT_USER_LOGIN")
+if not USER_LOGIN:
+    print("ERROR: INAT_USER_LOGIN is not set. Configure it via skills.entries.inaturalist.env.INAT_USER_LOGIN")
+    sys.exit(1)
 BASE_URL = os.environ.get("INAT_BASE_URL", "https://api.inaturalist.org/v1")
 PER_PAGE = 200  # max per the API
 
