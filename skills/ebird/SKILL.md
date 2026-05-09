@@ -117,7 +117,10 @@ The skill includes a personal data browser flow and SQLite importer at `import/`
    ```
    The page shows a "Success!" confirmation. eBird then emails a download link.
 4. **User provides the download URL** from the eBird email (`do-not-reply@ebird.org`).
-> ⚠️ **Rate limit:** eBird only generates one export per day. Do not request a download more than once every 24 hours — repeated requests will be rejected by eBird's server.
+
+   > ⚠️ **Rate limit:** eBird only generates one export per day. Do not request a download more than once every 24 hours — repeated requests will be rejected by eBird's server.
+
+   > 💡 **Troubleshooting — no email?** Check spam/junk folders. Whitelist `do-not-reply@ebird.org`. If nothing arrives within 24 hours, verify the email address on your eBird account.
 
 5. **Download, extract, and import:**
    ```bash
@@ -128,14 +131,78 @@ The skill includes a personal data browser flow and SQLite importer at `import/`
 
 The import is **idempotent** — re-running on a newer export updates existing rows and adds new ones without duplicating.
 
+### Import Script Internals
+
+The script (`import/import_csv_to_sqlite.py`) handles several eBird CSV quirks:
+
+| Decision | Why |
+|----------|-----|
+| `INSERT OR REPLACE` on `submission_id` | Re-imports don't create duplicates — same checklist, same row |
+| `safe()` helper instead of direct `.strip()` | eBird CSV has `NULL`-valued cells for trailing columns like Breeding Code — raw `.strip()` on `None` crashes |
+| `parse_int()` / `parse_float()` accept `"X"` as null | eBird uses `"X"` for presence-only counts (no number given) — maps to `NULL` in the DB |
+| `WAL` journal mode | Better concurrent read performance when other processes query the DB during imports |
+| Indexes on date/species/location | Common query patterns are date-range filtering, species lookups, and location grouping |
+| `utf-8-sig` encoding | iNaturalist exports may include a UTF-8 BOM — the script strips it automatically |
+
+### Schema Reference
+
+```sql
+observations(
+    submission_id    TEXT PRIMARY KEY,
+    common_name      TEXT NOT NULL,
+    scientific_name  TEXT NOT NULL,
+    taxonomic_order  INTEGER,
+    count_or_x       TEXT,
+    state_province   TEXT,
+    county           TEXT,
+    location_id      TEXT,
+    location_name    TEXT,
+    latitude         REAL,
+    longitude        REAL,
+    obs_date         TEXT,
+    obs_time         TEXT,
+    protocol         TEXT,
+    duration_min     INTEGER,
+    all_obs_reported INTEGER,
+    distance_km      REAL,
+    area_ha          REAL,
+    num_observers    INTEGER,
+    breeding_code    TEXT,
+    observation_details TEXT,
+    checklist_comments  TEXT,
+    ml_catalog_numbers  TEXT
+);
+
+metadata(key TEXT PRIMARY KEY, value TEXT);
+```
+
+Indexes: `obs_date`, `scientific_name`, `common_name`, `location_id`, `submission_id`.
+
 ### Agent Query Patterns for User Data
 
 Once imported, query the local database with SQLite:
 ```bash
+# Recent observations
+sqlite3 import/ebird.db "SELECT obs_date, common_name, location_name
+  FROM observations ORDER BY obs_date DESC LIMIT 10;"
+
+# Most frequently seen species (last 30 days)
 sqlite3 import/ebird.db "SELECT common_name, COUNT(*) AS cnt
   FROM observations
   WHERE obs_date >= date('now', '-30 days')
   GROUP BY common_name ORDER BY cnt DESC LIMIT 10;"
+
+# Observations at a specific location
+sqlite3 import/ebird.db "SELECT obs_date, common_name, scientific_name
+  FROM observations WHERE location_name LIKE '%Central Park%' ORDER BY obs_date;"
+
+# Export as CSV
+sqlite3 -header -csv import/ebird.db \
+  "SELECT obs_date, common_name, scientific_name, count_or_x, location_name
+   FROM observations ORDER BY obs_date;" > my_birds.csv
+
+# Database metadata
+sqlite3 import/ebird.db "SELECT key, value FROM metadata;"
 ```
 
 ## API Endpoint Categories
