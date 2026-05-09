@@ -87,6 +87,55 @@ eBird uses hierarchical region codes:
 
 Species codes are internal identifiers (e.g. `baleag` for Bald Eagle), not 4-letter banding codes.
 
+## User Data Import
+
+The skill includes a personal data browser flow and SQLite importer at `import/`. This lets you bootstrap a local database of the user's complete eBird observation history.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `import/import_csv_to_sqlite.py` | Reads a `MyEBirdData.csv` export, normalises fields, writes into a local SQLite database using `INSERT OR REPLACE` on `submission_id`. Python 3 stdlib only — no pip packages needed. |
+| `import/ebird.db` | Generated on first run. Schema includes `observations` table (all CSV fields), `metadata` table (record count, import timestamp, source file), and indexes on date, species, and location. Uses WAL journal mode. |
+
+### Import Workflow
+
+1. **Launch a managed browser** on a node where the user can log in to eBird:
+   ```bash
+   openclaw browser open "https://ebird.org/download"
+   ```
+2. **User logs in manually.** The managed Chrome session persists the login cookies.
+3. **Request the data export:**
+   ```bash
+   openclaw browser navigate <tab-id> "https://ebird.org/downloadMyData"
+   openclaw browser snapshot <tab-id>          # find the trigger button
+   openclaw browser act <tab-id> click <ref>   # click "Request My Observations"
+   ```
+   Or navigate directly to the trigger URL:
+   ```bash
+   openclaw browser navigate <tab-id> "https://ebird.org/downloadMyData/start"
+   ```
+   The page shows a "Success!" confirmation. eBird then emails a download link.
+4. **User provides the download URL** from the eBird email (`do-not-reply@ebird.org`).
+5. **Download, extract, and import:**
+   ```bash
+   curl -sL -o /tmp/ebird_download.zip "<url-from-email>"
+   cd /tmp && unzip -o ebird_download.zip
+   python3 import/import_csv_to_sqlite.py
+   ```
+
+The import is **idempotent** — re-running on a newer export updates existing rows and adds new ones without duplicating.
+
+### Agent Query Patterns for User Data
+
+Once imported, query the local database with SQLite:
+```bash
+sqlite3 import/ebird.db "SELECT common_name, COUNT(*) AS cnt
+  FROM observations
+  WHERE obs_date >= date('now', '-30 days')
+  GROUP BY common_name ORDER BY cnt DESC LIMIT 10;"
+```
+
 ## API Endpoint Categories
 
 See the reference files for full endpoint docs:
