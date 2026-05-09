@@ -61,6 +61,7 @@ DEFAULT_SESSION_DB = os.path.join(os.path.dirname(__file__), "openclaw-nature.db
 
 FALLBACK_EBIRD_DB = "/home/openclaw/.openclaw/workspace/zookeeper/modules/ebird/ebird.db"
 FALLBACK_INAT_DB = "/home/openclaw/.openclaw/workspace/skills/inaturalist/import/inat.db"
+DEFAULT_TAXONOMY_DB = os.path.join(os.path.dirname(__file__), "openclaw-nature.db")
 
 DISTANCE_THRESHOLD_KM = 1.0
 TIME_THRESHOLD_MINUTES = 120
@@ -308,6 +309,58 @@ def read_ebird_checklists(db_path, start_date=None, end_date=None):
     except Exception as e:
         print(f"  Error reading eBird DB: {e}", file=sys.stderr)
         return []
+
+
+# ── Taxonomy Lookup ────────────────────────────────────────────────────
+
+
+def load_species_lookup(db_path):
+    """Load canonical species taxonomy into lookup dicts.
+
+    Returns dict: {"ebird": {display_name: species_id},
+                   "inat":  {display_name: species_id}}
+    """
+    if not os.path.exists(db_path):
+        return {"ebird": {}, "inat": {}}
+
+    conn = sqlite3.connect(db_path)
+
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name IN ('species', 'ebird_species_map', 'inat_species_map')"
+    )]
+    if len(tables) < 3:
+        conn.close()
+        return {"ebird": {}, "inat": {}}
+
+    lookup = {"ebird": {}, "inat": {}}
+
+    for row in conn.execute(
+        "SELECT m.display_name, m.species_id "
+        "FROM ebird_species_map m "
+        "JOIN species s ON s.id = m.species_id"
+    ):
+        lookup["ebird"][row[0]] = row[1]
+
+    for row in conn.execute(
+        "SELECT m.display_name, m.species_id "
+        "FROM inat_species_map m "
+        "JOIN species s ON s.id = m.species_id"
+    ):
+        lookup["inat"][row[0]] = row[1]
+
+    conn.close()
+    return lookup
+
+
+def resolve_species_id(species_lookup, species_name, source):
+    """Resolve a species name to a canonical species_id."""
+    key_map = species_lookup.get(source, {})
+    sid = key_map.get(species_name)
+    if sid is not None:
+        return sid
+    other = "ebird" if source == "inat" else "inat"
+    return species_lookup.get(other, {}).get(species_name)
 
 
 # ── Session Data Structure ─────────────────────────────────────────────
@@ -690,24 +743,37 @@ CREATE TABLE IF NOT EXISTS session_observations (
     utc_timestamp TEXT,
     local_timestamp TEXT,
     is_overlay    INTEGER DEFAULT 0,  -- 1 = eBird time was assigned by overlay
+    species_id    INTEGER,
     details_json  TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_so_session ON session_observations(session_id);
-CREATE INDEX IF NOT EXISTS idx_so_source  ON session_observations(source);
+CREATE INDEX IF NOT EXISTS idx_so_session  ON session_observations(session_id);
+CREATE INDEX IF NOT EXISTS idx_so_source   ON session_observations(source);
+CREATE INDEX IF NOT EXISTS idx_so_species  ON session_observations(species_id);
 """
 
 
-def write_session_db(db_path, sessions, append=False):
-    """Write sessions to SQLite."""
-    mode = "append" if append else "overwrite"
-    exists = os.path.exists(db_path)
-    if exists and not append:
-        os.remove(db_path)
+def write_session_db(db_path, sessions, species_lookup=None, append=False):
+    """Write sessions to SQLite.
 
+    Args:
+        db_path: Path to output database
+        sessions: List of Session objects
+        species_lookup: Dict of {"ebird": {name: id}, "inat": {name: id}}
+            from load_species_lookup(). If None, species_id will be NULL.
+        append: If True, don't drop existing data
+    """
+    if species_lookup is None:
+        species_lookup = {"ebird": {}, "inat": {}}
+    mode = "append" if append else "overwrite"
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    if not append:
+        conn.execute("DROP TABLE IF EXISTS session_observations")
+        conn.execute("DROP TABLE IF EXISTS sessions")
     conn.executescript(SESSION_SCHEMA)
+    conn.execute("PRAGMA foreign_keys = ON")
 
     for sess in sessions:
         d = sess.to_dict()
@@ -737,26 +803,32 @@ def write_session_db(db_path, sessions, append=False):
                                      "sounds_json", "identifications_json", "place_guess"]
                  if k in obs}
             )
+            sid = resolve_species_id(
+                species_lookup, obs["species"], "inat"
+            )
             conn.execute(
                 """INSERT INTO session_observations
-                   (session_id, source, obs_id, species, lat, lng,
+                   (session_id, source, obs_id, species, species_id, lat, lng,
                     utc_timestamp, local_timestamp, is_overlay, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, obs["source"], obs["obs_id"], obs["species"],
-                 obs["lat"], obs["lng"],
+                 sid, obs["lat"], obs["lng"],
                  obs["utc_dt"].isoformat(), local_ts, 0, details),
             )
 
         # Write eBird overlay observations
         for e in sess.ebird_species:
             local_ts = utc_to_local_str(e["assigned_dt"]) if e["assigned_dt"] else ""
+            sid = resolve_species_id(
+                species_lookup, e["species"], "ebird"
+            )
             conn.execute(
                 """INSERT INTO session_observations
-                   (session_id, source, obs_id, species, lat, lng,
+                   (session_id, source, obs_id, species, species_id, lat, lng,
                     utc_timestamp, local_timestamp, is_overlay, details_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, "ebird", e["checklist_id"], e["species"],
-                 e["lat"], e["lng"],
+                 sid, e["lat"], e["lng"],
                  e["assigned_dt"].isoformat() if e["assigned_dt"] else "",
                  local_ts, 1, "{}"),
             )
@@ -778,6 +850,10 @@ def main():
     parser.add_argument("--ebird-db", default=DEFAULT_EBIRD_DB)
     parser.add_argument("--inat-db", default=DEFAULT_INAT_DB)
     parser.add_argument("--session-db", default=None)
+    parser.add_argument(
+        "--taxonomy-db", default=None,
+        help="Path to species taxonomy DB (default: session DB)"
+    )
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--dist", type=float, default=DISTANCE_THRESHOLD_KM)
@@ -790,6 +866,17 @@ def main():
     ebird_db = _resolve_db_path(args.ebird_db, FALLBACK_EBIRD_DB)
     inat_db = _resolve_db_path(args.inat_db, FALLBACK_INAT_DB)
     session_db = args.session_db if args.session_db else DEFAULT_SESSION_DB
+
+    # Load taxonomy for species resolution
+    taxonomy_db = args.taxonomy_db if args.taxonomy_db else session_db
+    species_lookup = load_species_lookup(taxonomy_db)
+    has_taxonomy = bool(species_lookup["ebird"]) or bool(species_lookup["inat"])
+    print(f"  Taxonomy DB:    {taxonomy_db}")
+    if has_taxonomy:
+        print(f"    {len(species_lookup['ebird'])} eBird + "
+              f"{len(species_lookup['inat'])} iNat species resolution entries")
+    else:
+        print("    (no taxonomy tables — species stored as text only)")
 
     print("OpenClaw Nature — Session Builder (Overlay Mode)")
     print("=" * 50)
@@ -834,7 +921,7 @@ def main():
 
     # Write DB
     if not args.no_db and session_db:
-        write_session_db(session_db, sessions, append=False)
+        write_session_db(session_db, sessions, species_lookup=species_lookup, append=False)
 
 
 if __name__ == "__main__":
