@@ -5,15 +5,43 @@ description: Query biodiversity observations, species taxonomy, places, projects
 
 # iNaturalist — OpenClaw Skill
 
+## Configuration
+
+The iNaturalist API is open for GET requests without authentication. For personal queries (your observations, identifications) the skill recognises a `user_login` parameter.
+
+### Setting the User Login
+
+**Via skills.entries config (recommended):**
+```json
+{
+  "skills": {
+    "entries": {
+      "inaturalist": {
+        "enabled": true,
+        "env": {
+          "INAT_USER_LOGIN": "your-username-here",
+          "INAT_BASE_URL": "https://api.inaturalist.org/v1"
+        }
+      }
+    }
+  }
+}
+```
+
+**Via agent env:** Set `INAT_USER_LOGIN` to your iNaturalist username.
+
+When `INAT_USER_LOGIN` is set, the skill uses it as the default `user_login` for observation queries — so you can search "my recent observations" without specifying the user each time.
+
+You can also set `INAT_API_TOKEN` (with `Authorization: Bearer` header) for higher rate limits.
+
 ## Quick Start
 
 Base URL defaults to `https://api.inaturalist.org/v1`.
-Most GET endpoints work without auth. With `INAT_API_TOKEN`, send as `Authorization: Bearer {INAT_API_TOKEN}` for higher rate limits.
 
 ### Search Recent Observations
 
 ```bash
-curl -s "$INAT_BASE_URL/observations?taxon_name={species}&place_id={id}&per_page=20"
+curl -s "$INAT_BASE_URL/observations?user_login=${INAT_USER_LOGIN:-{username}}&taxon_name={species}&per_page=20"
 ```
 
 ### Species Counts (What's been seen here?)
@@ -32,6 +60,12 @@ curl -s "$INAT_BASE_URL/taxa/autocomplete?q={search term}&per_page=5"
 
 ```bash
 curl -s "$INAT_BASE_URL/places/nearby?lat={lat}&lng={lng}"
+```
+
+### My Recent Observations
+
+```bash
+curl -s "$INAT_BASE_URL/observations?user_login=${INAT_USER_LOGIN}&per_page=50"
 ```
 
 ## API Endpoint Categories

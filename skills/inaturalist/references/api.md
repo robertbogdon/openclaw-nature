@@ -9,8 +9,10 @@ Auth: optional for GET (increases rate limits). Use `Authorization: Bearer {toke
 ```
 GET /observations
 ```
-**Key params:** `user_id`, `user_login`, `project_id`, `place_id`, `taxon_id`, `taxon_name`, `iconic_taxa`, `quality_grade`, `captive`, `endemic`, `native`, `introduced`, `threatened`, `geo`, `lat`/`lng`, `radius` (m), `swlat`/`swlng`/`nelat`/`nelng` (bbox), `created_on`, `created_d1`/`created_d2`, `observed_on`, `d1`/`d2`, `hrank`/`lrank` (taxon rank), `id`, `not_id`, `id_above`/`id_below`, `term_id`/`term_value_id` (annotations), `photos`, `videos`, `sounds`, `acc`, `acc_below`/`acc_above`, `order` (asc|desc), `order_by` (observed_on|created_at|species|votes), `per_page` (max 200), `page`
+**Key params:** `user_id`, `user_login` (or set via `INAT_USER_LOGIN` env), `project_id`, `place_id`, `taxon_id`, `taxon_name`, `iconic_taxa`, `quality_grade`, `captive`, `endemic`, `native`, `introduced`, `threatened`, `geo`, `lat`/`lng`, `radius` (m), `swlat`/`swlng`/`nelat`/`nelng` (bbox), `created_on`, `created_d1`/`created_d2`, `observed_on`, `d1`/`d2`, `hrank`/`lrank` (taxon rank), `id`, `not_id`, `id_above`/`id_below`, `term_id`/`term_value_id` (annotations), `photos`, `videos`, `sounds`, `acc`, `acc_below`/`acc_above`, `order` (asc|desc), `order_by` (observed_on|created_at|species|votes), `per_page` (max 200), `page`
 **Response:** Object with `total_results`, `page`, `per_page`, `results` array.
+
+> 💡 When `INAT_USER_LOGIN` is set via the skill config, use it as the default `user_login` for queries. Example: `curl -s "$INAT_BASE_URL/observations?user_login=$INAT_USER_LOGIN&per_page=50"` fetches the configured user's observations.
 
 ### Species Counts
 ```
