@@ -68,6 +68,30 @@ curl -s "$INAT_BASE_URL/places/nearby?lat={lat}&lng={lng}"
 curl -s "$INAT_BASE_URL/observations?user_login=${INAT_USER_LOGIN}&per_page=50"
 ```
 
+### Observations in a Date Range
+
+```bash
+# Observations observed between two dates
+curl -s "$INAT_BASE_URL/observations?d1=2025-06-01&d2=2025-06-30&per_page=50"
+
+# Observations created (uploaded) today
+curl -s "$INAT_BASE_URL/observations?user_login=${INAT_USER_LOGIN}&created_on=today&per_page=50"
+
+# Observations created after a specific timestamp
+curl -s "$INAT_BASE_URL/observations?created_after=2026-01-01T00:00:00%2B00:00&per_page=200"
+```
+
+### Incremental Sync (new observations only)
+
+Use `id_above` with your last known observation ID to pull only newer records:
+
+```bash
+# Get observations newer than ID 123456789
+curl -s "$INAT_BASE_URL/observations?id_above=123456789&user_login=${INAT_USER_LOGIN}&per_page=200&order=asc"
+```
+
+Paginate by looping `page` until `results` is empty.
+
 ## API Endpoint Categories
 
 See the reference files for full endpoint docs:
