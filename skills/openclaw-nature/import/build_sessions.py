@@ -225,10 +225,16 @@ def read_inat_observations(db_path, start_date=None, end_date=None):
 
         result = []
         for r in rows:
+            # Skip observations with no date at all
+            if r["observed_on"] is None:
+                continue
             utc_dt = parse_inat_timestamp(r["time_observed_at"])
             if utc_dt is None:
                 # Fallback: use noon on observed_on
-                d = datetime.fromisoformat(r["observed_on"])
+                try:
+                    d = datetime.fromisoformat(r["observed_on"])
+                except (ValueError, TypeError):
+                    continue
                 utc_dt = d.replace(hour=12, minute=0, second=0)
             species = r["species_guess"] or r["taxon_name"] or "Unknown"
             result.append({
